@@ -80,8 +80,8 @@ std::atomic<bool> g_runtime_reported{false};
 pid_t g_main_pid = 0;
 int g_status_fd = -1;
 void* g_runtime_handle = nullptr;
-std::string g_target_wrapper;
-std::string g_source;
+std::string* g_target_wrapper = nullptr;
+std::string* g_source = nullptr;
 
 HookSlot g_slots[kMaxSlots]{};
 std::atomic<size_t> g_slot_count{0};
@@ -164,9 +164,23 @@ extern "C" __attribute__((visibility("default"))) void qq_magic_napi_register(vo
 
 namespace {
 
+void openqq_init();
+
+bool self_dl_info(Dl_info& info) {
+    return ::dladdr(reinterpret_cast<const void*>(&openqq_init), &info) != 0;
+}
+
+bool is_self_symbol(void* sym) {
+    if (!sym) return false;
+    Dl_info self_info{};
+    Dl_info sym_info{};
+    if (!self_dl_info(self_info) || !::dladdr(sym, &sym_info)) return false;
+    return self_info.dli_fbase == sym_info.dli_fbase;
+}
+
 void strip_preload_self_impl() {
     Dl_info self_info{};
-    if (!::dladdr(reinterpret_cast<void*>(&qq_magic_napi_register), &self_info) || !self_info.dli_fname) return;
+    if (!self_dl_info(self_info) || !self_info.dli_fname) return;
     std::string self_real = realpath_of(self_info.dli_fname);
     const char* preload = std::getenv("LD_PRELOAD");
     if (!preload || !*preload) return;
@@ -346,7 +360,7 @@ void* run_bootstrap(AddonInit original, void* env, void* exports) {
         void* escaped = nullptr;
         check_napi(global(env, &object));
         check_napi(set(env, object, "__openqq_exports", result ? result : exports));
-        check_napi(str(env, g_source.c_str(), SIZE_MAX, &src));
+        check_napi(str(env, g_source ? g_source->c_str() : "", SIZE_MAX, &src));
         check_napi(run(env, src, &value));
         check_napi(escape(env, scope, value, &escaped));
         result = escaped;
@@ -377,7 +391,8 @@ void* dispatch_thunk(size_t idx, void* env, void* exports) {
     const HookSlot& slot = g_slots[idx];
     if (!slot.original) return exports;
     Dl_info info{};
-    bool target = ::dladdr(reinterpret_cast<void*>(slot.original), &info) && realpath_of(info.dli_fname) == g_target_wrapper;
+    bool target = g_target_wrapper && ::dladdr(reinterpret_cast<void*>(slot.original), &info) &&
+        realpath_of(info.dli_fname) == *g_target_wrapper;
     send_status("{\"stage\":\"addon_register\",\"name\":" + json_quote(slot.modname ? slot.modname : "") +
         ",\"target\":" + (target ? "true}" : "false}"));
     if (!target || g_bootstrapped.load(std::memory_order_acquire)) {
@@ -518,17 +533,21 @@ void openqq_init() {
     ::fcntl(status_fd, F_SETFD, FD_CLOEXEC);
     g_status_fd = status_fd;
     g_main_pid = ::getpid();
-    bool ok = read_config_pipe(boot_fd, g_target_wrapper, g_source);
+    std::string target_wrapper;
+    std::string source;
+    bool ok = read_config_pipe(boot_fd, target_wrapper, source);
     ::close(boot_fd);
     if (!ok) {
         send_status("{\"stage\":\"error\",\"error\":\"missing or invalid bootstrap configuration\"}");
         close_status_fd();
         return;
     }
+    g_target_wrapper = new std::string(std::move(target_wrapper));
+    g_source = new std::string(std::move(source));
     ::pthread_atfork(nullptr, nullptr, on_fork_child);
     g_active.store(true, std::memory_order_release);
     void* sym = ::dlsym(RTLD_DEFAULT, "qq_magic_napi_register");
-    if (sym && sym != reinterpret_cast<void*>(&qq_magic_napi_register)) {
+    if (sym && !is_self_symbol(sym)) {
         report_runtime_if_known(sym);
     }
 }
@@ -541,7 +560,7 @@ void qq_magic_napi_register(void* module_ptr) {
     if (!real_reg && g_runtime_handle) {
         real_reg = reinterpret_cast<MagicRegisterFn>(::dlsym(g_runtime_handle, "qq_magic_napi_register"));
     }
-    if (!real_reg) return;
+    if (!real_reg || is_self_symbol(reinterpret_cast<void*>(real_reg))) return;
     if (!g_active.load(std::memory_order_acquire) || ::getpid() != g_main_pid || !module_ptr) {
         real_reg(module_ptr);
         return;
@@ -549,8 +568,8 @@ void qq_magic_napi_register(void* module_ptr) {
     report_runtime_if_known(reinterpret_cast<void*>(real_reg));
     auto* mod = static_cast<NapiModule*>(module_ptr);
     Dl_info info{};
-    bool target = mod->nm_register_func && ::dladdr(reinterpret_cast<void*>(mod->nm_register_func), &info) &&
-        realpath_of(info.dli_fname) == g_target_wrapper;
+    bool target = g_target_wrapper && mod->nm_register_func && ::dladdr(reinterpret_cast<void*>(mod->nm_register_func), &info) &&
+        realpath_of(info.dli_fname) == *g_target_wrapper;
     send_status("{\"stage\":\"addon_register\",\"name\":" + json_quote(mod->nm_modname ? mod->nm_modname : "") +
         ",\"target\":" + (target ? "true}" : "false}"));
     if (!target || g_bootstrapped.load(std::memory_order_acquire)) {
@@ -577,11 +596,11 @@ void* dlopen(const char* filename, int flags) {
         return real_dlopen(filename, flags);
     }
     std::string resolved = realpath_of(filename);
-    if (resolved != g_target_wrapper) {
+    if (!g_target_wrapper || resolved != *g_target_wrapper) {
         void* handle = real_dlopen(filename, flags);
         if (handle && !g_runtime_reported.load(std::memory_order_acquire)) {
             void* reg = ::dlsym(handle, "qq_magic_napi_register");
-            if (reg && reg != reinterpret_cast<void*>(&qq_magic_napi_register)) {
+            if (reg && !is_self_symbol(reg)) {
                 if (!g_runtime_handle) g_runtime_handle = handle;
                 report_runtime_if_known(reg);
             }
@@ -591,7 +610,7 @@ void* dlopen(const char* filename, int flags) {
 
     ::pthread_mutex_lock(&g_hook_mutex);
     void* reg_sym = ::dlsym(RTLD_DEFAULT, "qq_magic_napi_register");
-    bool need_trap = reg_sym && reg_sym != reinterpret_cast<void*>(&qq_magic_napi_register);
+    bool need_trap = reg_sym && !is_self_symbol(reg_sym);
     bool trapped = false;
     if (need_trap) {
         report_runtime_if_known(reg_sym);
@@ -639,7 +658,7 @@ void* dlopen(const char* filename, int flags) {
     ::pthread_mutex_unlock(&g_hook_mutex);
     if (handle && !g_runtime_reported.load(std::memory_order_acquire)) {
         void* reg = ::dlsym(handle, "qq_magic_napi_register");
-        if (reg && reg != reinterpret_cast<void*>(&qq_magic_napi_register)) {
+        if (reg && !is_self_symbol(reg)) {
             if (!g_runtime_handle) g_runtime_handle = handle;
             report_runtime_if_known(reg);
         }
