@@ -272,7 +272,7 @@ export default function Setup() {
                   <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-medium [&::-webkit-details-marker]:hidden"><Terminal className="size-4 text-muted-foreground" aria-hidden />运行示例 Bot</summary>
                   <div className="grid gap-2 border-t px-4 py-3 text-caption text-secondary-foreground">
                     <p>新开终端，设置 OneBot 令牌并运行示例，然后私聊发送 /ping 测试。</p>
-                    <pre className="overflow-x-auto rounded-md bg-muted p-3 font-mono text-xs text-foreground">{"$env:ONEBOT_TOKEN = '你的令牌'\nnpm run bot"}</pre>
+                    <pre className="overflow-x-auto rounded-md bg-muted p-3 font-mono text-xs text-foreground">{detected?.platform === 'linux' ? "export ONEBOT_TOKEN='你的令牌'\nnpm run bot" : "$env:ONEBOT_TOKEN = '你的令牌'\nnpm run bot"}</pre>
                     <p>调用模型还需设置 BOT_API_URL、BOT_API_KEY、BOT_MODEL 和 BOT_ALLOW_USERS，再私聊发送 /ai 问题。</p>
                   </div>
                 </details>

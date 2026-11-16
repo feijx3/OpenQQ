@@ -1,0 +1,30 @@
+services:
+  openqq:
+    build:
+      context: .
+      # Optional: override the Linux QQ .deb URL if automatic lookup is blocked in your network.
+      # args:
+      #   QQ_DEB_URL: "https://..."
+    image: openqq:latest
+    container_name: openqq
+    restart: unless-stopped
+    shm_size: "512m"
+    ports:
+      # Bound to 127.0.0.1 by default for security; use an SSH tunnel or reverse proxy for remote access.
+      - "127.0.0.1:17860:17860" # WebUI setup & console
+      - "127.0.0.1:3001:3001"   # OneBot v11 forward WebSocket
+      - "127.0.0.1:6080:6080"   # noVNC screen for first-time QQ login / captcha
+    volumes:
+      - ./docker-data/config:/app/config
+      - ./docker-data/qq:/root/.config/QQ
+    environment:
+      TZ: Asia/Shanghai
+      OPENQQ_WEB_HOST: "0.0.0.0"
+      OPENQQ_VNC: "1"
+      # Optional: auto-create config/openqq.json on first boot instead of using the WebUI setup wizard.
+      # OPENQQ_AUTO_INIT: "1"
+      # OPENQQ_ACCESS_TOKEN: "replace-with-at-least-16-random-ascii-chars"
+      # OPENQQ_WS_HOST: "0.0.0.0"
+      # OPENQQ_WS_PORT: "3001"
+      # OPENQQ_REVERSE_WS_URL: "ws://host.docker.internal:8080/onebot/v11/ws"
+      # OPENQQ_VNC_PASSWORD: "change-me"

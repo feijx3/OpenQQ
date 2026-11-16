@@ -1,8 +1,25 @@
 import { createServer } from 'node:net';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-export async function createNativeChannel(path = `\\\\.\\pipe\\openqq-${randomBytes(16).toString('hex')}`) {
+function allocateChannelPath() {
+  if (process.platform === 'win32') {
+    return { path: `\\\\.\\pipe\\openqq-${randomBytes(16).toString('hex')}`, ownedDir: null };
+  }
+  const base = tmpdir();
+  const root = Buffer.byteLength(join(base, 'oqq-123456', 'ipc.sock')) <= 96 ? base : '/tmp';
+  const dir = mkdtempSync(join(root, 'oqq-'));
+  chmodSync(dir, 0o700);
+  return { path: join(dir, 'ipc.sock'), ownedDir: dir };
+}
+
+export async function createNativeChannel(customPath) {
+  const allocated = customPath ? { path: customPath, ownedDir: null } : allocateChannelPath();
+  const path = allocated.path;
+  const isWindowsPipe = process.platform === 'win32' || path.startsWith('\\\\.\\pipe\\');
   const events = new EventEmitter();
   const token = randomBytes(32).toString('hex');
   const sockets = new Set();
@@ -57,10 +74,16 @@ export async function createNativeChannel(path = `\\\\.\\pipe\\openqq-${randomBy
   });
   server.maxConnections = 8;
   server.on('error', error => events.emit('failure', error));
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(path, resolve);
-  });
+  try {
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(path, resolve);
+    });
+    if (!isWindowsPipe) chmodSync(path, 0o600);
+  } catch (error) {
+    if (allocated.ownedDir) rmSync(allocated.ownedDir, { recursive: true, force: true });
+    throw error;
+  }
   return {
     events, path, token,
     request(request, timeoutMs = 20000) {
@@ -82,6 +105,8 @@ export async function createNativeChannel(path = `\\\\.\\pipe\\openqq-${randomBy
       failPending();
       for (const socket of sockets) socket.destroy();
       await new Promise(resolve => server.close(resolve));
+      if (allocated.ownedDir) rmSync(allocated.ownedDir, { recursive: true, force: true });
+      else if (!isWindowsPipe) rmSync(path, { force: true });
     },
   };
 }

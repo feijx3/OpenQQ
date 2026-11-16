@@ -63,8 +63,9 @@ function createMetrics() {
   };
 }
 
-export async function startWebUI({ port = 17860, status = { phase: 'detached' }, dispatch, configuration } = {}) {
+export async function startWebUI({ port = 17860, host = '127.0.0.1', allowedHosts = [], status = { phase: 'detached' }, dispatch, configuration } = {}) {
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('WebUI 端口必须为 0..65535 的整数');
+  if (!['127.0.0.1', '0.0.0.0'].includes(host)) throw new Error('WebUI 监听地址仅支持 127.0.0.1 或 0.0.0.0');
   const token = randomBytes(32).toString('hex');
   const clients = new Set();
   const history = [];
@@ -73,6 +74,7 @@ export async function startWebUI({ port = 17860, status = { phase: 'detached' },
   let sequence = 0;
   let state = { ...status };
   let origin;
+  let validHosts;
   let closing = false;
   let activeBodies = 0;
   let activeActions = 0;
@@ -80,6 +82,18 @@ export async function startWebUI({ port = 17860, status = { phase: 'detached' },
   const assets = new Map(await Promise.all([...files].map(async ([path, [name, type]]) => [path, { type,
     body: await readFile(new URL('../web/' + name, import.meta.url)),
   }])));
+
+  function isAllowedRequest(request) {
+    const reqHost = request.headers.host;
+    if (!reqHost || !validHosts.has(reqHost)) return false;
+    const reqOrigin = request.headers.origin;
+    if (!reqOrigin) return true;
+    if (host === '127.0.0.1') return reqOrigin === origin;
+    try {
+      const parsed = new URL(reqOrigin);
+      return ['http:', 'https:'].includes(parsed.protocol) && parsed.host === reqHost;
+    } catch { return false; }
+  }
 
   function json(response, code, data) {
     response.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -110,7 +124,7 @@ export async function startWebUI({ port = 17860, status = { phase: 'detached' },
     response.setHeader('Referrer-Policy', 'no-referrer');
     response.setHeader('X-Frame-Options', 'DENY');
     response.setHeader('Content-Security-Policy', `default-src 'self'; script-src 'self'; style-src 'self' 'nonce-${styleNonce}'; style-src-attr 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`);
-    if (closing || request.headers.host !== new URL(origin).host || (request.headers.origin && request.headers.origin !== origin)) {
+    if (closing || !isAllowedRequest(request)) {
       json(response, 403, { message: '仅允许本机同源访问' }); return;
     }
     if (!request.url || !request.url.startsWith('/') || request.url.startsWith('//')) {
@@ -189,9 +203,21 @@ export async function startWebUI({ port = 17860, status = { phase: 'detached' },
   server.headersTimeout = 10000;
   await new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(port, '127.0.0.1', resolve);
+    server.listen(port, host, resolve);
   });
-  origin = 'http://127.0.0.1:' + server.address().port;
+  const boundPort = server.address().port;
+  origin = 'http://127.0.0.1:' + boundPort;
+  validHosts = new Set([`127.0.0.1:${boundPort}`]);
+  if (host === '0.0.0.0') {
+    validHosts.add(`localhost:${boundPort}`);
+    validHosts.add(`[::1]:${boundPort}`);
+    for (const item of allowedHosts) {
+      const value = String(item ?? '').trim();
+      if (!value) continue;
+      const hasPort = value.startsWith('[') ? /\]:\d+$/.test(value) : /:\d+$/.test(value);
+      validHosts.add(hasPort ? value : `${value}:${boundPort}`);
+    }
+  }
   const heartbeat = setInterval(() => {
     for (const client of clients) {
       if (client.writableLength > 4 * 1024 * 1024) client.destroy();

@@ -61,6 +61,25 @@ test('WebUI rejects foreign origins and rebinding Host headers before dispatchin
   assert.equal(actions, 0);
 });
 
+test('WebUI bound to 0.0.0.0 for Docker still rejects DNS rebinding and foreign origins', async t => {
+  const { web, headers } = await fixture(t, { host: '0.0.0.0', allowedHosts: ['openqq.local'] });
+  const port = new URL(web.origin).port;
+  const localRes = await fetch(`http://localhost:${port}/api/metrics`, { headers: { ...headers, Origin: `http://localhost:${port}` } });
+  assert.equal(localRes.status, 200);
+  const allowedStatus = await new Promise((resolve, reject) => {
+    const request = httpRequest(web.origin + '/api/metrics', { headers: { Authorization: headers.Authorization, Host: `openqq.local:${port}`, Origin: `http://openqq.local:${port}` } }, response => { response.resume(); resolve(response.statusCode); });
+    request.on('error', reject); request.end();
+  });
+  assert.equal(allowedStatus, 200);
+  const badOrigin = await fetch(web.origin + '/api/action', { method: 'POST', headers: { ...headers, Origin: 'https://untrusted.example' }, body: '{"action":"get_status"}' });
+  assert.equal(badOrigin.status, 403);
+  const badHost = await new Promise((resolve, reject) => {
+    const request = httpRequest(web.origin + '/', { headers: { Host: `attacker.example:${port}` } }, response => { response.resume(); resolve(response.statusCode); });
+    request.on('error', reject); request.end();
+  });
+  assert.equal(badHost, 403);
+});
+
 test('JSON action requests reuse the dispatcher and preserve responses and echo', async t => {
   const requests = [];
   const expected = { status: 'ok', retcode: 0, data: { message_id: 7 }, echo: { id: '中文' } };

@@ -1,8 +1,12 @@
 # Normalize text to LF in the repository; Windows checkouts stay consistent with the tests.
 * text=auto eol=lf
 
+*.sh text eol=lf
+Dockerfile text eol=lf
+
 *.png binary
 *.jpg binary
 *.ico binary
 *.node binary
 *.dll binary
+*.so binary

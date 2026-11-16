@@ -1,16 +1,18 @@
 import { build } from 'esbuild';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildUI } from '../ui/build.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-const releaseName = `${pkg.name}-v${pkg.version}-win-x64`;
+const win = process.platform === 'win32';
+const platformTag = win ? `win-${process.arch}` : `${process.platform}-${process.arch}`;
+const releaseName = `${pkg.name}-v${pkg.version}-${platformTag}`;
 const distRoot = join(root, 'dist');
 const releaseDir = join(distRoot, releaseName);
-const archivePath = join(distRoot, `${releaseName}.zip`);
+const archivePath = join(distRoot, win ? `${releaseName}.zip` : `${releaseName}.tar.gz`);
 
 function writeOut(relPath, content) {
   const fullPath = join(releaseDir, relPath);
@@ -45,53 +47,92 @@ function createReleaseMetadata() {
   writeOut('package.json', JSON.stringify(runtimePkg, null, 2) + '\n');
 
   copyOut('config/openqq.example.json');
-  copyOut('native/bin/openqq-launch.exe');
-  copyOut('native/bin/openqq-bootstrap.dll');
+  copyOut(win ? 'native/bin/openqq-launch.exe' : 'native/bin/openqq-launch');
+  copyOut(win ? 'native/bin/openqq-bootstrap.dll' : 'native/bin/openqq-bootstrap.so');
+  if (!win) {
+    chmodSync(join(releaseDir, 'native/bin/openqq-launch'), 0o755);
+    chmodSync(join(releaseDir, 'native/bin/openqq-bootstrap.so'), 0o755);
+  }
   copyOut('LICENSE');
   // Optional voice encoder (MIT): shipped when installed, so WAV can be sent as a voice message without extra setup.
   const silkDir = join(root, 'node_modules', 'silk-wasm');
   if (existsSync(silkDir)) cpSync(silkDir, join(releaseDir, 'node_modules', 'silk-wasm'), { recursive: true });
 
-  writeOut('openqq.cmd', [
-    '@echo off',
-    'setlocal',
-    'cd /d "%~dp0"',
-    'if "%~1"=="" (',
-    '  node "%~dp0src\\main.mjs" start',
-    ') else (',
-    '  node "%~dp0src\\main.mjs" %*',
-    ')',
-    'if errorlevel 1 if "%~1"=="" pause',
-    '',
-  ].join('\r\n'));
+  if (win) {
+    writeOut('openqq.cmd', [
+      '@echo off',
+      'setlocal',
+      'cd /d "%~dp0"',
+      'if "%~1"=="" (',
+      '  node "%~dp0src\\main.mjs" start',
+      ') else (',
+      '  node "%~dp0src\\main.mjs" %*',
+      ')',
+      'if errorlevel 1 if "%~1"=="" pause',
+      '',
+    ].join('\r\n'));
 
-  writeOut('README.txt', [
-    `OpenQQ v${pkg.version} (Windows x64 Release)`,
-    '========================================',
-    '',
-    '环境要求:',
-    '1. Windows 10 / 11 x64 与 Windows x64 QQ NT 9.x',
-    '2. Node.js >= 22 (https://nodejs.org/)',
-    '3. 原生引导器已包含，使用 Windows 系统运行库',
-    '',
-    '快速启动:',
-    '- 双击 openqq.cmd 或在终端执行: openqq.cmd',
-    '- 环境检测: openqq.cmd doctor',
-    '- 仅打开 Web 配置向导: openqq.cmd webui',
-    '- 命令行初始化配置: openqq.cmd init',
-    '',
-    '首次启动会自动打开本机 WebUI 配置向导；请先完全退出正在运行的 QQ，再由 OpenQQ 拉起 QQ 登录。',
-    '',
-  ].join('\r\n'));
+    writeOut('README.txt', [
+      `OpenQQ v${pkg.version} (Windows x64 Release)`,
+      '========================================',
+      '',
+      '环境要求:',
+      '1. Windows 10 / 11 x64 与 Windows x64 QQ NT 9.x',
+      '2. Node.js >= 22 (https://nodejs.org/)',
+      '3. 原生引导器已包含，使用 Windows 系统运行库',
+      '',
+      '快速启动:',
+      '- 双击 openqq.cmd 或在终端执行: openqq.cmd',
+      '- 环境检测: openqq.cmd doctor',
+      '- 仅打开 Web 配置向导: openqq.cmd webui',
+      '- 命令行初始化配置: openqq.cmd init',
+      '',
+      '首次启动会自动打开本机 WebUI 配置向导；请先完全退出正在运行的 QQ，再由 OpenQQ 拉起 QQ 登录。',
+      '',
+    ].join('\r\n'));
+  } else {
+    const sh = writeOut('openqq.sh', [
+      '#!/usr/bin/env sh',
+      'set -eu',
+      'DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)',
+      'cd "$DIR"',
+      'if [ "$#" -eq 0 ]; then',
+      '  exec node "$DIR/src/main.mjs" start',
+      'else',
+      '  exec node "$DIR/src/main.mjs" "$@"',
+      'fi',
+      '',
+    ].join('\n'));
+    chmodSync(sh, 0o755);
+
+    writeOut('README.txt', [
+      `OpenQQ v${pkg.version} (Linux ${process.arch} Release)`,
+      '========================================',
+      '',
+      '环境要求:',
+      '1. Linux (x64 / arm64) 与官方 Linux QQ NT（通常位于 /opt/QQ）',
+      '2. Node.js >= 22 (https://nodejs.org/)',
+      '3. 原生引导器已包含（openqq-launch 与 openqq-bootstrap.so）',
+      '',
+      '快速启动:',
+      '- 启动桥接: ./openqq.sh',
+      '- 环境检测: ./openqq.sh doctor',
+      '- 仅打开 Web 配置向导: ./openqq.sh webui',
+      '- 命令行初始化配置: ./openqq.sh init',
+      '',
+      '首次启动会自动打开本机 WebUI 配置向导；请先完全退出正在运行的 QQ，再由 OpenQQ 拉起 QQ 登录。',
+      '',
+    ].join('\n'));
+  }
 }
 
-function packZip() {
-  if (process.platform === 'win32') {
+function packArchive() {
+  if (win) {
     const tarExe = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
     execFileSync(tarExe, ['-a', '-c', '-f', archivePath, '-C', distRoot, releaseName], { stdio: 'inherit' });
     return;
   }
-  execFileSync('zip', ['-r', '-q', archivePath, releaseName], { cwd: distRoot, stdio: 'inherit' });
+  execFileSync('tar', ['-czf', archivePath, '-C', distRoot, releaseName], { stdio: 'inherit' });
 }
 
 async function main() {
@@ -139,14 +180,14 @@ async function main() {
   copyOut('web/setup.html', 'web/setup.html');
   copyOut('web/logo.svg', 'web/logo.svg');
 
-  // 4. Runtime package metadata, launchers and zip archive.
+  // 4. Runtime package metadata, launchers and archive.
   createReleaseMetadata();
-  packZip();
+  packArchive();
 
   const kb = bytes => (bytes / 1024).toFixed(1) + ' KB';
   console.log(`Release built in ${Date.now() - started}ms:`);
-  console.log(`  Dir:  ${releaseDir}`);
-  console.log(`  Zip:  ${archivePath} (${kb(statSync(archivePath).size)})`);
+  console.log(`  Dir:     ${releaseDir}`);
+  console.log(`  Archive: ${archivePath} (${kb(statSync(archivePath).size)})`);
   console.log(`  src/main.mjs:       ${kb(Buffer.byteLength(mainOut))}`);
   console.log(`  native/session.cjs: ${kb(Buffer.byteLength(sessionOut))}`);
   console.log(`  web/app.js:         ${kb(statSync(join(releaseDir, 'web/app.js')).size)}`);

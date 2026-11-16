@@ -80,7 +80,7 @@ export default function Settings() {
         <Section icon={FolderOpen} title="QQ 客户端" description="OpenQQ 以原生方式启动并挂接的 QQ NT"
           action={<Button variant="outline" size="sm" onClick={check} loading={checking}>{!checking && <RefreshCw />}检测</Button>}>
           <div className="grid gap-4">
-            <Field label="安装目录" htmlFor="qq-root" error={issues.qqRoot} description="QQ NT 的安装目录，例如 C:\Program Files\Tencent\QQNT">
+            <Field label="安装目录" htmlFor="qq-root" error={issues.qqRoot} description={environment?.platform === 'linux' ? 'QQ NT 的安装目录，例如 /opt/QQ' : 'QQ NT 的安装目录，例如 C:\\Program Files\\Tencent\\QQNT'}>
               <Input id="qq-root" value={draft.qqRoot} spellCheck={false} className="font-mono text-caption" aria-invalid={Boolean(issues.qqRoot)} aria-describedby="qq-root-hint"
                 onChange={event => config.update(next => { next.qqRoot = event.target.value; })} />
             </Field>

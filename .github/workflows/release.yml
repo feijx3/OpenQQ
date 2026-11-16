@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Verify tag matches package.json version
+        shell: bash
+        run: |
+          pkg_ver=$(node -e "console.log(JSON.parse(require('fs').readFileSync('package.json','utf8')).version)")
+          tag_ver="${GITHUB_REF_NAME#v}"
+          if [ "$pkg_ver" != "$tag_ver" ]; then
+            echo "Tag version ($tag_ver) does not match package.json ($pkg_ver)" >&2
+            exit 1
+          fi
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake ninja-build g++
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --build-arg INSTALL_QQ=0 -t openqq:release .
+      - run: docker run --rm openqq:release doctor
+
+  release:
+    needs: [build, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate SHA256 checksums
+        run: |
+          cd artifacts
+          sha256sum *.zip *.tar.gz > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true

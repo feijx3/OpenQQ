@@ -10,14 +10,15 @@
 > [!WARNING]
 > 非官方项目，与腾讯无关。挂接 QQ 客户端可能违反《QQ 软件许可及服务协议》，账号有被限制或封禁的风险。请只在自己的账号和设备上用于学习研究，风险自负。
 
-Windows x64 QQ NT 的 OneBot v11 桥接。一个 C++ 启动器加一个自带的 DLL，在 QQ 注册原生模块的地方（`qq_magic_napi_register`）挂上会话；用的是 Windows 调试 API，不开 Electron 的 `--inspect` 端口。原生部分只依赖系统自带的 UCRT，不用另装运行库。OneBot、WebUI 和会话逻辑是 Node.js / JavaScript。
+Windows x64 与 Linux（x64 / arm64）QQ NT 的 OneBot v11 桥接，同时支持 Docker 容器化部署。通过 C++ 原生启动器在 QQ 注册原生模块的地方（`qq_magic_napi_register`）挂接会话，不开启 Electron 的 `--inspect` 端口，也不修改 QQ 安装目录中的文件。Windows 原生部分仅依赖系统自带的 UCRT；Linux 原生部分使用 `LD_PRELOAD` 预加载引导库并在加载目标 `wrapper.node` 时注入会话。OneBot、WebUI 和会话逻辑为 Node.js / JavaScript。
 
 ## 功能
 
 - OneBot v11：正向 WebSocket 服务端（Bearer Header 或 `access_token` 查询参数鉴权，鉴权失败有限流），反向 WebSocket 客户端（最多 8 个目标，QQ 会话就绪时断线后每 3 秒重连一次）。心跳固定每 15 秒一次，目前不能配置。
-- 启动前检查：扫描注册表和常见路径找到 QQ NT，再解析 `QQNT.dll`、`wrapper.node` 的 x64 PE 导出表，确认 `qq_magic_napi_register` 等 N-API 符号都在。
+- 启动前检查：Windows 扫描注册表和常见路径找到 QQ NT，解析 `QQNT.dll`、`wrapper.node` 的 x64 PE 导出表；Linux 探测 `/opt/QQ` 等路径并解析 `qq`、`wrapper.node` 的 ELF64 动态符号表，确认 `qq_magic_napi_register` 等 N-API 符号都在。
 - 发送与管理：文本、CQ 码、@、表情、图片、语音、视频、文件、骰子、猜拳、引用回复；撤回、踢人、禁言、全员禁言、管理员、群名片、群名、退群、处理入群/好友申请、点赞，以及群和成员查询。详见 [docs/actions.md](docs/actions.md)。
-- WebUI：只监听 `127.0.0.1`，每次启动生成临时访问密钥。有配置向导（`/setup`）和控制台：概览（会话、吞吐、连接状态）、按会话收发消息、事件流、OneBot 动作调试、运行日志，以及账号、连接和设置管理。
+- WebUI：默认只监听 `127.0.0.1`（容器内可通过 `--web-host 0.0.0.0` 配合本机端口映射），每次启动生成临时访问密钥。有配置向导（`/setup`）和控制台：概览（会话、吞吐、连接状态）、按会话收发消息、事件流、OneBot 动作调试、运行日志，以及账号、连接和设置管理。
+- Docker：内置 [Dockerfile](Dockerfile) 与 [compose.yaml](compose.yaml)，通过 `Xvfb` + 可选 `noVNC` 支持无头扫码与滑块登录。
 - 终端：交互模式支持命令补全、历史记录和 `/verbose`、`/clear`、`/quit`；接管道或加 `--json` 时输出 OneBot 的 JSON Lines。
 
 ## 界面预览
@@ -32,14 +33,16 @@ Windows x64 QQ NT 的 OneBot v11 桥接。一个 C++ 启动器加一个自带的
 
 ## 环境要求
 
-- Windows 10 / 11 x64
-- Windows x64 QQ NT 9.x。测试过 `9.9.33-52230` 和 `9.9.37-54395`；其他带完整 N-API 导出的 9.x 也能启动，但会提示该版本没有测试过。
+- Windows 10 / 11 x64（QQ NT 9.x，已测试 `9.9.33-52230` 和 `9.9.37-54395`）或 Linux x64 / arm64（官方 Linux QQ NT，默认路径 `/opt/QQ`）或 Docker
+- 其他带完整 N-API 导出的同平台 QQ NT 构建也能启动，但会提示该版本没有完整实机验证。
 - Node.js >= 22
-- 从源码构建需要本机已有 CMake 和 C++17 x64 编译器（LLVM-MinGW / MinGW 或 Visual Studio），用 MinGW 时还要 Ninja。发布包里已有编译好的原生组件，不需要编译器。
+- 从源码构建需要本机已有 CMake 和 C++17 编译器（Windows 用 LLVM-MinGW / MinGW + Ninja 或 Visual Studio；Linux 用 `g++` / `clang++`，可选 `ninja`）。发布包里已有编译好的原生组件，不需要编译器。
 
 ## 快速开始
 
-克隆并构建：
+Docker 部署请直接看 [docs/docker.md](docs/docker.md)（`docker compose up -d --build`）。
+
+源码克隆并构建：
 
 ```powershell
 git clone https://github.com/feijx3/OpenQQ.git
@@ -109,9 +112,9 @@ npm start -- --qq-root "C:\Program Files\Tencent\QQNT"    # 临时指定 QQ 目�
 
 ## 安全相关
 
-- WebUI 只绑定 `127.0.0.1`。访问密钥用 `timingSafeEqual` 比较；页面加载后立刻用 `history.replaceState` 清掉 URL 片段里的密钥，之后只放在当前标签页的 `sessionStorage`。
-- 路径和会话脚本通过标准输入交给 `native/bin/openqq-launch.exe`，包括命名管道名和一次性令牌，所以它们不会出现在进程命令行里。
-- 配置文件拒绝 UNC 路径和控制字符。启动器只从项目目录加载，并通过文件句柄确认 QQ、wrapper 和 DLL 的真实路径。
+- WebUI 默认只绑定 `127.0.0.1`。访问密钥用 `timingSafeEqual` 比较；页面加载后立刻用 `history.replaceState` 清掉 URL 片段里的密钥，之后只放在当前标签页的 `sessionStorage`。
+- 路径和会话脚本通过标准输入交给原生启动器（`openqq-launch.exe` / `openqq-launch`），包括管道/Unix Socket 路径和一次性令牌，所以它们不会出现在进程命令行里；Linux 端通过仅父子可见的匿名管道将配置传入 `openqq-bootstrap.so` 后立即关闭描述符并清理环境变量，不进入环境变量或子进程。
+- 配置文件拒绝 UNC 路径和控制字符。启动器只从项目目录加载，并通过文件句柄或 `realpath` 确认 QQ、wrapper 和原生模块的真实路径；IPC Unix Socket 置于 `0700` 权限临时目录内且仅对当前用户可读写（`0600`）。
 - OneBot 正向 WebSocket 服务端会限制单个 IP 的连续鉴权失败：60 秒内超过 20 次返回 429。WebUI 的访问密钥是每次启动随机生成的 256 位值，没有单独的失败限流，只限制同时执行的动作数。以 `//` 开头的请求地址会被两个服务拒绝，反向连接不跟随重定向。
 
 ## 测试
@@ -128,6 +131,7 @@ npm run test:native
 
 ## 文档
 
+- [Linux 与 Docker 部署指南](docs/docker.md)
 - [机器人接入与示例配置](docs/connect.md)
 - [支持的 OneBot 动作与终端交互](docs/actions.md)
 - [事件格式、扩展字段与已知限制](docs/events.md)

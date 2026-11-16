@@ -10,10 +10,11 @@ permissions:
 
 jobs:
   test:
-    # The bridge targets Windows QQ NT; tests cover Windows path and executable rules.
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [windows-latest, ubuntu-latest]
         node: [22, 24]
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +22,15 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake ninja-build g++
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --build-arg INSTALL_QQ=0 -t openqq:ci .
+      - run: docker run --rm openqq:ci doctor

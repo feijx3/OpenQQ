@@ -4,7 +4,7 @@ import { mkdirSync, writeFileSync, renameSync, readFileSync, createWriteStream }
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { inspectQQ, bootstrapInput, verifiedVersions } from './qq.mjs';
+import { inspectQQ, resolveLinuxWrapper, bootstrapInput, verifiedVersions } from './qq.mjs';
 import { detectEnvironment, isQQProcessRunning, probeNative } from './env.mjs';
 import { createNativeChannel } from './ipc.mjs';
 import { createEventConverter } from './onebot.mjs';
@@ -22,6 +22,8 @@ const runtimeDir = join(projectDir, '.runtime');
 const { values, positionals } = parseArgs({ allowPositionals: true, options: {
   'qq-root': { type: 'string' },
   'web-port': { type: 'string' },
+  'web-host': { type: 'string' },
+  'no-sandbox': { type: 'boolean', default: false },
   config: { type: 'string', default: join(projectDir, 'config', 'openqq.json') },
   json: { type: 'boolean', default: false },
   verbose: { type: 'boolean', default: false },
@@ -46,8 +48,10 @@ function promptFor(paint, state) {
 }
 
 function checkClient(qq) {
-  if (process.platform !== 'win32' || !qq.supported) {
-    throw new Error('当前仅支持 Windows x64 QQ NT（需包含 qq_magic_napi_register 与 N-API 导出）');
+  const supportedHost = (process.platform === 'win32' && process.arch === 'x64')
+    || (process.platform === 'linux' && ['x64', 'arm64'].includes(process.arch));
+  if (!supportedHost || qq.platform !== process.platform || qq.arch !== process.arch || !qq.supported) {
+    throw new Error('当前仅支持 Windows x64 与 Linux x64/arm64 QQ NT（需包含 qq_magic_napi_register 与 N-API 导出）');
   }
   const native = probeNative(projectDir);
   if (!native.ready) throw new Error(native.error);
@@ -95,7 +99,7 @@ async function start(qq, config, existingWebUI) {
   const qqLog = createWriteStream(qqLogPath, { flags: 'w' });
   qqLog.on('error', () => {});
   out.banner(`OpenQQ ${pkg.version}`, [['QQ 版本', qq.version], ['WebUI', webui.url],
-    ['OneBot', config.ws.enabled ? `ws://127.0.0.1:${config.ws.port}（令牌见 WebUI 接入配置）` : '反向 WS：QQ 就绪后连接'], ['QQ 原始日志', qqLogPath]]);
+    ['OneBot', config.ws.enabled ? `ws://${config.ws.host}:${config.ws.port}（令牌见 WebUI 接入配置）` : '反向 WS：QQ 就绪后连接'], ['QQ 原始日志', qqLogPath]]);
   let finish;
   let reject;
   const stopped = new Promise((resolve, fail) => { finish = resolve; reject = fail; });
@@ -140,11 +144,13 @@ async function start(qq, config, existingWebUI) {
   });
   channel.events.once('disconnected', finish);
   channel.events.on('failure', reject);
+  const driverEnv = values['no-sandbox'] ? { ...process.env, OPENQQ_QQ_NO_SANDBOX: '1' } : process.env;
   const driver = spawn(native.launcher, [], {
-    windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true, env: driverEnv, stdio: ['pipe', 'pipe', 'pipe'],
   });
+  const wrapper = resolveLinuxWrapper(qq);
   // Keep IPC token and pipe path out of process command-line arguments.
-  driver.stdin.write(bootstrapInput({ executable: qq.executable, wrapper: qq.wrapper, dll: native.dll,
+  driver.stdin.write(bootstrapInput({ executable: qq.executable, wrapper, dll: native.dll,
     payload: join(projectDir, 'native/session.cjs'), pipe: channel.path, token: channel.token }));
   // QQ inherits the bootstrap's stdio, so its own console output arrives here as well: keep all of it in
   // .runtime/qq.log and show only OpenQQ's bootstrap stages (QQ lines appear with /verbose).
@@ -196,10 +202,14 @@ async function start(qq, config, existingWebUI) {
 let savedConfig;
 let startFromWeb;
 let webRunning = false;
+const webHost = values['web-host'] ?? process.env.OPENQQ_WEB_HOST ?? '127.0.0.1';
+const webAllowedHosts = (process.env.OPENQQ_WEB_ALLOW_HOSTS ?? '').split(',').map(item => item.trim()).filter(Boolean);
+
 async function configurationWebUI(config, running = false) {
   webRunning = running;
   let webui;
-  webui = await startWebUI({ port: Number(values['web-port'] ?? config.webPort), status: { phase: savedConfig ? 'detached' : 'setup' }, configuration: {
+  webui = await startWebUI({ port: Number(values['web-port'] ?? config.webPort), host: webHost, allowedHosts: webAllowedHosts,
+    status: { phase: savedConfig ? 'detached' : 'setup' }, configuration: {
     get: () => {
       const currentConfig = savedConfig ?? config;
       const detected = detectEnvironment({ projectDir, qqRoot: currentConfig.qqRoot });
@@ -245,6 +255,7 @@ async function configureInBrowser(config) {
 
 try {
   if (values['web-port'] !== undefined && (!/^\d+$/.test(values['web-port']) || Number(values['web-port']) > 65535)) throw new Error('--web-port 必须为 0..65535 的整数');
+  if (!['127.0.0.1', '0.0.0.0'].includes(webHost)) throw new Error('--web-host 仅支持 127.0.0.1 或 0.0.0.0');
   const command = positionals[0] ?? 'doctor';
   savedConfig = readConfig(values.config);
   const detectedForDefault = savedConfig ? null : detectEnvironment({ projectDir, qqRoot: values['qq-root'] });
@@ -259,7 +270,7 @@ try {
     if (env.qq?.path) {
       try { inspected = inspectQQ(env.qq.path); } catch (error) { inspected = { error: error.message }; }
     }
-    console.log(JSON.stringify({ platform: process.platform, node: process.version, detected: env, qq: inspected }, null, 2));
+    console.log(JSON.stringify({ platform: process.platform, arch: process.arch, node: process.version, detected: env, qq: inspected }, null, 2));
   }
   else if (command === 'start') {
     let webui;

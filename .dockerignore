@@ -1,0 +1,15 @@
+.git
+.github
+.runtime
+dist
+node_modules
+native/bin
+PreviewVideo
+TutorialVideo
+config/openqq.json
+config/*.tmp
+docker-data
+*.log
+*.tmp
+.env
+.env.*

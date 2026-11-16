@@ -8,8 +8,8 @@ import { request as httpRequest } from 'node:http';
 import { PassThrough } from 'node:stream';
 import WebSocket from 'ws';
 
-import { isUncPath, probeNative } from '../src/env.mjs';
-import { readPE64Info, inspectQQ } from '../src/qq.mjs';
+import { isUncPath, probeNative, isQQProcessRunning } from '../src/env.mjs';
+import { readPE64Info, readELF64Info, inspectQQ, resolveLinuxWrapper } from '../src/qq.mjs';
 import { defaultConfig, validateConfig } from '../src/config.mjs';
 import { sanitizeTerminal, createConsole } from '../src/console.mjs';
 import { createEventConverter } from '../src/onebot.mjs';
@@ -72,6 +72,62 @@ function makeSyntheticPE64(exportNames = [], machine = 0x8664) {
   return buf;
 }
 
+function makeSyntheticELF64(exportNames = [], machine = 0x3e) {
+  const strChunks = [Buffer.from([0])];
+  const nameOffsets = exportNames.map(name => {
+    const offset = strChunks.reduce((sum, item) => sum + item.length, 0);
+    strChunks.push(Buffer.from(name + '\0', 'utf8'));
+    return offset;
+  });
+  const dynstr = Buffer.concat(strChunks);
+  const symCount = exportNames.length + 1; // index 0 = STN_UNDEF
+  const dynsym = Buffer.alloc(symCount * 24);
+  exportNames.forEach((_, idx) => {
+    const off = (idx + 1) * 24;
+    dynsym.writeUInt32LE(nameOffsets[idx], off);
+    dynsym.writeUInt8((1 << 4) | 2, off + 4); // STB_GLOBAL | STT_FUNC
+    dynsym.writeUInt16LE(1, off + 6); // defined section index != SHN_UNDEF
+  });
+
+  const ehdrSize = 64;
+  const dynstrOffset = ehdrSize;
+  const dynsymOffset = dynstrOffset + dynstr.length;
+  const shoff = dynsymOffset + dynsym.length;
+  const shnum = 3; // NULL, .dynstr, .dynsym
+  const buf = Buffer.alloc(shoff + shnum * 64);
+
+  // Elf64_Ehdr
+  buf.writeUInt32BE(0x7f454c46, 0);
+  buf[4] = 2; // ELFCLASS64
+  buf[5] = 1; // ELFDATA2LSB
+  buf[6] = 1; // EV_CURRENT
+  buf.writeUInt16LE(3, 16); // ET_DYN
+  buf.writeUInt16LE(machine, 18);
+  buf.writeUInt32LE(1, 20);
+  buf.writeBigUInt64LE(BigInt(shoff), 40);
+  buf.writeUInt16LE(64, 52);
+  buf.writeUInt16LE(64, 58);
+  buf.writeUInt16LE(shnum, 60);
+
+  dynstr.copy(buf, dynstrOffset);
+  dynsym.copy(buf, dynsymOffset);
+
+  // Section 1: .dynstr (SHT_STRTAB = 3)
+  const sh1 = shoff + 64;
+  buf.writeUInt32LE(3, sh1 + 4);
+  buf.writeBigUInt64LE(BigInt(dynstrOffset), sh1 + 24);
+  buf.writeBigUInt64LE(BigInt(dynstr.length), sh1 + 32);
+
+  // Section 2: .dynsym (SHT_DYNSYM = 11, link = 1)
+  const sh2 = shoff + 128;
+  buf.writeUInt32LE(11, sh2 + 4);
+  buf.writeBigUInt64LE(BigInt(dynsymOffset), sh2 + 24);
+  buf.writeBigUInt64LE(BigInt(dynsym.length), sh2 + 32);
+  buf.writeUInt32LE(1, sh2 + 40);
+  buf.writeBigUInt64LE(24n, sh2 + 56);
+  return buf;
+}
+
 test('env & config reject UNC paths and do not require an interpreter', () => {
   assert.equal(isUncPath('\\\\server\\share'), true);
   assert.equal(isUncPath('//evil/share'), true);
@@ -123,6 +179,75 @@ test('readPE64Info and inspectQQ verify x64 exports without hard-locking a singl
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('readELF64Info and inspectQQ verify Linux x64/arm64 ELF exports and hot-update wrappers', () => {
+  const elfValid = makeSyntheticELF64(REQUIRED_NAPI_EXPORTS, 0x3e);
+  const parsed = readELF64Info(elfValid);
+  assert.equal(parsed.valid, true);
+  assert.equal(parsed.x64, true);
+  assert.equal(parsed.arch, 'x64');
+  assert.equal(parsed.exports.has('qq_magic_napi_register'), true);
+
+  const armValid = makeSyntheticELF64(REQUIRED_NAPI_EXPORTS, 0xb7);
+  assert.equal(readELF64Info(armValid).arch, 'arm64');
+  assert.equal(readELF64Info(Buffer.from('not-an-elf')).valid, false);
+
+  const root = mkdtempSync(join(tmpdir(), 'openqq-linux-qq-'));
+  const configHome = mkdtempSync(join(tmpdir(), 'openqq-xdg-'));
+  try {
+    const version = '3.2.15-30366';
+    const appDir = join(root, 'resources', 'app');
+    mkdirSync(appDir, { recursive: true });
+    writeFileSync(join(appDir, 'package.json'), JSON.stringify({ name: 'qq-chat', version, eleArch: 'x64' }));
+    writeFileSync(join(root, 'qq'), elfValid);
+    writeFileSync(join(appDir, 'wrapper.node'), makeSyntheticELF64([], 0x3e));
+
+    const info = inspectQQ(root);
+    assert.equal(info.platform, 'linux');
+    assert.equal(info.version, version);
+    assert.equal(info.arch, 'x64');
+    assert.equal(info.supported, true);
+    assert.deepEqual(info.missingExports, []);
+    assert.equal(resolveLinuxWrapper(info, configHome), info.wrapper);
+
+    // Hot-updated wrapper.node in $XDG_CONFIG_HOME/QQ/versions/<curVersion> is picked up when valid
+    const hotVer = '3.2.16-31000';
+    const hotDir = join(configHome, 'QQ', 'versions', hotVer, 'resources', 'app');
+    mkdirSync(hotDir, { recursive: true });
+    writeFileSync(join(configHome, 'QQ', 'versions', 'config.json'), JSON.stringify({ curVersion: hotVer }));
+    const hotWrapper = join(hotDir, 'wrapper.node');
+    writeFileSync(hotWrapper, makeSyntheticELF64([], 0x3e));
+    assert.equal(resolveLinuxWrapper(info, configHome), hotWrapper);
+
+    // Architecture mismatch flips supported to false
+    writeFileSync(join(appDir, 'wrapper.node'), makeSyntheticELF64([], 0xb7));
+    assert.equal(inspectQQ(root).supported, false);
+
+    // Missing required N-API export flips supported to false
+    writeFileSync(join(appDir, 'wrapper.node'), makeSyntheticELF64([], 0x3e));
+    writeFileSync(join(root, 'qq'), makeSyntheticELF64(['napi_get_global'], 0x3e));
+    const incomplete = inspectQQ(root);
+    assert.equal(incomplete.supported, false);
+    assert.ok(incomplete.missingExports.includes('qq_magic_napi_register'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(configHome, { recursive: true, force: true });
+  }
+});
+
+test('isQQProcessRunning checks /proc on Linux without matching node or openqq', { skip: process.platform !== 'linux' }, t => {
+  const procRoot = mkdtempSync(join(tmpdir(), 'openqq-proc-'));
+  t.after(() => rmSync(procRoot, { recursive: true, force: true }));
+  mkdirSync(join(procRoot, '999991'));
+  writeFileSync(join(procRoot, '999991', 'comm'), 'node\n');
+  writeFileSync(join(procRoot, '999991', 'cmdline'), 'node\0/opt/openqq/src/main.mjs\0');
+  assert.equal(isQQProcessRunning(procRoot), false);
+
+  mkdirSync(join(procRoot, '999992'));
+  writeFileSync(join(procRoot, '999992', 'comm'), 'qq\n');
+  writeFileSync(join(procRoot, '999992', 'cmdline'), '/opt/QQ/qq\0--no-sandbox\0');
+  assert.equal(isQQProcessRunning(procRoot), true);
 });
 
 test('sanitizeTerminal strips ANSI/OSC control bytes and prototype keys remain safe', () => {

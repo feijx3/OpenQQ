@@ -75,6 +75,7 @@ export interface OpenQQConfig {
 
 export interface Detected {
   platform: string;
+  arch?: string;
   qq: { path: string; valid: boolean; targetMatch: boolean; version: string | null; arch: string | null; error: string | null };
   qqCandidates: { path: string; version?: string; supported?: boolean }[];
   native: { ready: boolean; error: string | null; launcher?: string; dll?: string };
