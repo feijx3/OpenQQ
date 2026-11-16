@@ -9,17 +9,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <iostream>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace {
@@ -41,17 +38,25 @@ std::string json_quote(const std::string& input) {
 }
 
 void log_native(const std::string& value) {
-    std::cerr << "[OpenQQ/native] " << value << std::endl;
+    std::fprintf(stderr, "[OpenQQ/native] %s\n", value.c_str());
+    std::fflush(stderr);
 }
 
 std::string line_from_stdin(size_t limit) {
     std::string result;
     char c = 0;
-    while (std::cin.get(c) && c != '\n') {
+    for (;;) {
+        ssize_t n = ::read(STDIN_FILENO, &c, 1);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            throw std::runtime_error("failed to read bootstrap input");
+        }
+        if (n == 0) throw std::runtime_error("missing bootstrap input");
+        if (c == '\n') break;
         if (result.size() >= limit || c == '\0' || c == '\r') throw std::runtime_error("invalid bootstrap input");
         result += c;
     }
-    if (result.empty() || !std::cin) throw std::runtime_error("missing bootstrap input");
+    if (result.empty()) throw std::runtime_error("missing bootstrap input");
     return result;
 }
 
@@ -174,7 +179,7 @@ std::string extract_json_string(const std::string& json, const std::string& key)
 }
 
 void run_launcher(const std::string& executable, const std::string& wrapper_path, const std::string& so_path,
-                  std::string source, int cancel_read_fd, const std::atomic<bool>& cancelled) {
+                  std::string source) {
     std::string qq = local_path(executable);
     require(::access(qq.c_str(), X_OK) == 0, "executable is not runnable");
     std::string wrapper = local_path(wrapper_path);
@@ -191,6 +196,8 @@ void run_launcher(const std::string& executable, const std::string& wrapper_path
     }
     ::fcntl(cfg_pipe[1], F_SETFD, FD_CLOEXEC);
     ::fcntl(status_pipe[0], F_SETFD, FD_CLOEXEC);
+    int status_flags = ::fcntl(status_pipe[0], F_GETFL, 0);
+    if (status_flags >= 0) ::fcntl(status_pipe[0], F_SETFL, status_flags | O_NONBLOCK);
 
     const std::string exe_dir = dirname_of(qq);
     const bool is_qq_bin = basename_of(qq) == "qq";
@@ -212,7 +219,6 @@ void run_launcher(const std::string& executable, const std::string& wrapper_path
     if (child == 0) {
         ::close(cfg_pipe[1]);
         ::close(status_pipe[0]);
-        ::close(cancel_read_fd);
 
         int dev_null = ::open("/dev/null", O_RDONLY);
         if (dev_null >= 0) {
@@ -280,61 +286,64 @@ void run_launcher(const std::string& executable, const std::string& wrapper_path
         return false;
     };
 
+    auto drain_status = [&]() {
+        char chunk[4096];
+        for (;;) {
+            ssize_t n = ::read(status_pipe[0], chunk, sizeof(chunk));
+            if (n > 0) {
+                buffer.append(chunk, static_cast<size_t>(n));
+                continue;
+            }
+            if (n == 0) {
+                status_eof = true;
+                break;
+            }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            status_eof = true;
+            break;
+        }
+        for (size_t pos = 0; (pos = buffer.find('\n')) != std::string::npos;) {
+            std::string one = buffer.substr(0, pos);
+            buffer.erase(0, pos + 1);
+            if (handle_line(one)) {
+                ::close(status_pipe[0]);
+                return true;
+            }
+        }
+        return false;
+    };
+
     try {
         while (std::chrono::steady_clock::now() < deadline) {
-            if (cancelled.load(std::memory_order_acquire)) {
-                throw std::runtime_error("bootstrap cancelled (stage: " + stage + ")");
-            }
             int wstatus = 0;
             pid_t done = ::waitpid(child, &wstatus, WNOHANG);
             if (done == child) {
-                // Drain any remaining status messages before reporting exit.
-                char tail[4096];
-                for (;;) {
-                    ssize_t n = ::read(status_pipe[0], tail, sizeof(tail));
-                    if (n > 0) buffer.append(tail, static_cast<size_t>(n));
-                    else break;
-                }
-                for (size_t pos = 0; (pos = buffer.find('\n')) != std::string::npos;) {
-                    std::string one = buffer.substr(0, pos);
-                    buffer.erase(0, pos + 1);
-                    if (handle_line(one)) {
-                        ::close(status_pipe[0]);
-                        return;
-                    }
-                }
+                if (drain_status()) return;
                 throw std::runtime_error("QQ exited before bootstrap completed (" + exit_reason(wstatus) + "; stage: " + stage + ")");
             }
 
             struct pollfd fds[2]{};
             nfds_t nfds = 0;
+            int status_idx = -1;
             if (!status_eof) {
+                status_idx = static_cast<int>(nfds);
                 fds[nfds].fd = status_pipe[0];
                 fds[nfds].events = POLLIN;
                 nfds++;
             }
-            fds[nfds].fd = cancel_read_fd;
+            int stdin_idx = static_cast<int>(nfds);
+            fds[nfds].fd = STDIN_FILENO;
             fds[nfds].events = POLLIN;
             nfds++;
 
             int rc = ::poll(fds, nfds, 25);
             if (rc < 0 && errno != EINTR) require(false, "poll");
-            if (rc > 0 && !status_eof && (fds[0].revents & (POLLIN | POLLHUP))) {
-                char chunk[4096];
-                ssize_t n = ::read(status_pipe[0], chunk, sizeof(chunk));
-                if (n > 0) {
-                    buffer.append(chunk, static_cast<size_t>(n));
-                    for (size_t pos = 0; (pos = buffer.find('\n')) != std::string::npos;) {
-                        std::string one = buffer.substr(0, pos);
-                        buffer.erase(0, pos + 1);
-                        if (handle_line(one)) {
-                            ::close(status_pipe[0]);
-                            return;
-                        }
-                    }
-                } else if (n == 0) {
-                    status_eof = true;
-                }
+            if (rc > 0 && status_idx >= 0 && (fds[status_idx].revents & (POLLIN | POLLHUP))) {
+                if (drain_status()) return;
+            }
+            if (rc > 0 && (fds[stdin_idx].revents & (POLLIN | POLLHUP | POLLERR))) {
+                throw std::runtime_error("bootstrap cancelled (stage: " + stage + ")");
             }
         }
         throw std::runtime_error("bootstrap timed out after 30 seconds (stage: " + stage + ")");
@@ -348,30 +357,14 @@ void run_launcher(const std::string& executable, const std::string& wrapper_path
 
 int main() {
     ::signal(SIGPIPE, SIG_IGN);
-    int cancel_pipe[2]{-1, -1};
     try {
         auto executable = line_from_stdin(32768);
         auto wrapper = line_from_stdin(32768);
         auto so = line_from_stdin(32768);
         auto source = line_from_stdin(1048576);
-        require(::pipe(cancel_pipe) == 0, "pipe cancel");
-        ::fcntl(cancel_pipe[0], F_SETFD, FD_CLOEXEC);
-        ::fcntl(cancel_pipe[1], F_SETFD, FD_CLOEXEC);
-        static std::atomic<bool> cancelled{false};
-        int cancel_write = cancel_pipe[1];
-        std::thread([cancel_write] {
-            std::cin.get();
-            cancelled.store(true, std::memory_order_release);
-            char b = 1;
-            ssize_t ignored = ::write(cancel_write, &b, 1);
-            (void)ignored;
-            ::close(cancel_write);
-        }).detach();
-        run_launcher(executable, wrapper, so, std::move(source), cancel_pipe[0], cancelled);
-        ::close(cancel_pipe[0]);
+        run_launcher(executable, wrapper, so, std::move(source));
         return 0;
     } catch (const std::exception& error) {
-        if (cancel_pipe[0] >= 0) ::close(cancel_pipe[0]);
         log_native("{\"stage\":\"error\",\"error\":" + json_quote(error.what()) + "}");
         return 1;
     }

@@ -113,6 +113,7 @@ static int addon_marker = 0;
 
 __attribute__((noinline))
 static void* addon_initialize(void*, void* exports) {
+    if (exports) ++(*static_cast<int*>(exports));
     return exports;
 }
 

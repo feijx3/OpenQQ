@@ -4,6 +4,7 @@ import http from 'node:http';
 import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createMediaPreparer, imageInfo, isBlockedAddress, safeName, silkInfo, videoInfo, wavInfo, wavToPcm } from '../src/media.mjs';
 
 const le16 = value => { const b = Buffer.alloc(2); b.writeUInt16LE(value); return b; };
@@ -110,7 +111,7 @@ test('images and files resolve from local paths, file:// URLs and base64, and lo
   const image = await w.put('pic.png', png(64, 32));
   const prepared = await media.prepare({ message: [
     { type: 'image', data: { file: image } },
-    { type: 'image', data: { file: 'file:///' + image.replaceAll('\\', '/') } },
+    { type: 'image', data: { file: pathToFileURL(image).href } },
     { type: 'image', data: { file: 'base64://' + png(10, 20).toString('base64'), summary: '[图]' } },
     { type: 'text', data: { text: 'keep me' } },
   ] });

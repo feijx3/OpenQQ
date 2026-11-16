@@ -37,7 +37,7 @@ foreach(target openqq-launch openqq-bootstrap)
 endforeach()
 
 include(CTest)
-if(BUILD_TESTING)
+if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../test/native-fixture.cpp")
   add_library(QQNT SHARED ../test/native-fixture.cpp)
   set_target_properties(QQNT PROPERTIES PREFIX "")
   add_executable(openqq-fixture ../test/native-fixture.cpp)
