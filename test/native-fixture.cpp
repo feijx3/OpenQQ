@@ -209,13 +209,17 @@ NOINLINE static void* initialize(void*, void* exports) {
     sleep_ms(1);
     return exports;
 }
+static void* init_last_registered() {
+    auto* entry = registered_count > 0 ? registered_modules[registered_count - 1] : nullptr;
+    return entry && entry->init ? entry->init(&global_object, &global_object) : nullptr;
+}
 API void RunFixture(callback decoy) {
     napi_module unrelated = {0, 0, "fixture-decoy.node", decoy, "wrapper", nullptr, {}};
     qq_magic_napi_register(&unrelated);
-    unrelated.init(&global_object, &global_object);
+    init_last_registered();
     napi_module module = {1, 0, "fixture-wrapper.node", initialize, "QQNT", nullptr, {}};
     qq_magic_napi_register(&module);
-    auto result = module.init(&global_object, &global_object);
+    auto result = init_last_registered();
     std::string path;
     if (output_path(path)) {
         const char* outcome = result == &facade_object && scope_closed ? "escaped replacement" : "original return";
