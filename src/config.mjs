@@ -10,7 +10,8 @@ export function defaultConfig(detected = {}) {
     qqRoot: detected.qqRoot || process.env.OPENQQ_QQ_ROOT || defaultRoot,
     webPort: 17860,
     accessToken: randomBytes(32).toString('hex'),
-    ws: { enabled: true, host: '127.0.0.1', port: 3001 },
+    // Inside a container the published port only reaches a socket bound to 0.0.0.0 (the Dockerfile sets OPENQQ_WS_HOST).
+    ws: { enabled: true, host: ['127.0.0.1', '0.0.0.0'].includes(process.env.OPENQQ_WS_HOST) ? process.env.OPENQQ_WS_HOST : '127.0.0.1', port: 3001 },
     reverseWs: [],
   };
 }

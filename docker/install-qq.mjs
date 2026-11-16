@@ -8,7 +8,7 @@ const explicitUrl = (process.env.QQ_DEB_URL || '').trim();
 const outPath = process.argv[2] || '/tmp/linuxqq.deb';
 
 function extractJsonObject(text) {
-  const start = text.indexOf('{');
+  const start = text.indexOf('{', text.indexOf('params'));
   const end = text.lastIndexOf('}');
   if (start < 0 || end <= start) throw new Error('Could not find JSON object in QQ download manifest');
   return JSON.parse(text.slice(start, end + 1));
@@ -83,11 +83,12 @@ async function downloadDeb(url) {
 async function main() {
   let targetUrl = explicitUrl;
   if (!targetUrl) {
+    // pcConfig.json tracks the current release; linuxQQDownload.js is a stale JSONP file (it still lists 3.2.9), so it is only a fallback.
     try {
-      targetUrl = await resolveFromDownloadManifest();
-    } catch (err) {
-      console.warn(`[OpenQQ/docker] Manifest lookup failed (${err.message}), trying fallback...`);
       targetUrl = await resolveFromPcConfig();
+    } catch (err) {
+      console.warn(`[OpenQQ/docker] pcConfig lookup failed (${err.message}), trying fallback...`);
+      targetUrl = await resolveFromDownloadManifest();
     }
     targetUrl = await signUrlIfNeeded(targetUrl);
   }

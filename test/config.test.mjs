@@ -23,6 +23,14 @@ test('config persists validated settings atomically and refuses invalid replacem
   assert.throws(() => validateConfig({ ...config, ws: { ...config.ws, enabled: false } }), /至少启用/);
 });
 
+test('default WebSocket host follows OPENQQ_WS_HOST (container) and ignores other values', t => {
+  const previous = process.env.OPENQQ_WS_HOST;
+  t.after(() => { if (previous === undefined) delete process.env.OPENQQ_WS_HOST; else process.env.OPENQQ_WS_HOST = previous; });
+  process.env.OPENQQ_WS_HOST = '0.0.0.0'; assert.equal(defaultConfig().ws.host, '0.0.0.0');
+  process.env.OPENQQ_WS_HOST = 'example.org'; assert.equal(defaultConfig().ws.host, '127.0.0.1');
+  delete process.env.OPENQQ_WS_HOST; assert.equal(defaultConfig().ws.host, '127.0.0.1');
+});
+
 test('CLI initialization fails clearly without an interactive terminal', async () => {
   await assert.rejects(setupCLI('unused', defaultConfig(), { input: { isTTY: false } }), /npm run webui/);
 });
