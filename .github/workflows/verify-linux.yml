@@ -1,0 +1,107 @@
+# Temporary: exercises the Linux build against the official Linux QQ package. Lives only on verify/** branches.
+name: Verify Linux (temporary)
+
+on:
+  push:
+    branches: ['verify/**']
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake ninja-build g++ binutils file
+      - run: npm ci
+      - run: npm test
+      - name: Native binary requirements
+        if: always()
+        run: |
+          for f in native/bin/openqq-launch native/bin/openqq-bootstrap.so; do
+            echo "== $f"; file "$f" || true
+            objdump -T "$f" | grep -oE '(GLIBC|GLIBCXX|CXXABI|GCC)_[0-9.]+' | sort -Vu | tr '\n' ' '; echo
+            readelf -d "$f" | grep -E 'NEEDED|RPATH|RUNPATH' || true
+          done
+          echo "== symbols exported by the bootstrap library"
+          nm -D --defined-only native/bin/openqq-bootstrap.so
+
+  docker:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image with the official Linux QQ package
+        run: docker build -t openqq:verify .
+      - name: doctor
+        run: docker run --rm openqq:verify doctor
+      - name: Static facts about the installed client
+        if: always()
+        run: |
+          docker run --rm --entrypoint bash openqq:verify -c '
+            apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq --no-install-recommends binutils file >/dev/null 2>&1
+            cd /opt/QQ || exit 1
+            echo "--- layout"; ls -la /opt/QQ | head -60; ls -la resources/app | head -80
+            echo "--- package.json fields"
+            node -e "const p=require(\"/opt/QQ/resources/app/package.json\"); console.log(JSON.stringify({name:p.name,version:p.version,main:p.main,eleArch:p.eleArch,isByteCodeShell:p.isByteCodeShell,platform:p.platform}))"
+            echo "--- qq ELF"; file qq; readelf -d qq | grep -E "NEEDED|RPATH|RUNPATH|FLAGS"
+            echo "--- qq exports"
+            readelf -Ws --dyn-syms qq | grep -E " (qq_magic_napi_register|napi_module_register|napi_run_script|napi_get_global|_Znwm|_ZdlPv)\$" || echo "(none of the probed names)"
+            echo "--- wrapper.node"; file resources/app/wrapper.node
+            readelf -d resources/app/wrapper.node | grep -E "NEEDED|RPATH|RUNPATH|FLAGS|INIT"
+            echo "--- wrapper imports"
+            readelf -Ws --dyn-syms resources/app/wrapper.node | grep -E "qq_magic|napi_module_register|napi_register_module" || echo "(none)"
+            echo "--- wrapper relocations for qq_magic"
+            readelf -Wr resources/app/wrapper.node | grep -E "qq_magic" || echo "(none)"
+            echo "--- modules that call qq_magic_napi_register"
+            for f in $(find /opt/QQ -name "*.node" | head -40); do echo "$f: $(readelf -Ws --dyn-syms "$f" 2>/dev/null | grep -c qq_magic_napi_register)"; done
+            echo "--- entry of qq_magic_napi_register"
+            addr=$(readelf -Ws --dyn-syms qq | awk "\$8==\"qq_magic_napi_register\"{print \$2}" | head -1)
+            echo "addr=$addr"
+            [ -n "$addr" ] && objdump -d --start-address=0x$addr --stop-address=$((0x$addr+48)) qq | tail -n +7 | head -20
+            true
+          '
+      - name: How the client itself loads wrapper.node
+        if: always()
+        run: |
+          docker run --rm --shm-size=512m --entrypoint bash openqq:verify -c '
+            Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 &
+            sleep 1
+            cd /opt/QQ
+            LD_DEBUG=files LD_DEBUG_OUTPUT=/tmp/ld DISPLAY=:99 timeout 30 ./qq --no-sandbox --disable-gpu --disable-dev-shm-usage >/tmp/qq.out 2>&1
+            echo "qq exit=$?"
+            echo "--- processes that produced loader logs"; ls /tmp | grep -c "^ld\." || true
+            echo "--- loader lines mentioning the native modules"
+            grep -HE "wrapper\.node|major\.node" /tmp/ld.* | grep -E "file=|calling init" | cut -c1-260 | head -40
+            echo "--- client preload lines"
+            grep -aE "preload|Preload" /tmp/qq.out | cut -c1-260 | head -30
+            true
+          '
+      - name: Start without logging in and wait for the hook
+        run: |
+          docker run -d --name oq --shm-size=512m -e OPENQQ_AUTO_INIT=1 -e OPENQQ_VNC=0 openqq:verify
+          ok=0
+          for i in $(seq 1 60); do
+            if docker logs oq 2>&1 | grep -q "\"stage\":\"bootstrapped\""; then ok=1; break; fi
+            if [ "$(docker inspect -f '{{.State.Running}}' oq)" != "true" ]; then break; fi
+            sleep 2
+          done
+          sleep 20
+          echo "===== container log"; docker logs oq 2>&1 | tail -n 200 | cut -c1-400
+          echo "===== status.json"; docker exec oq cat /app/.runtime/status.json || true
+          echo "===== processes"; docker exec oq ps -eo pid,ppid,stat,etime,args | cut -c1-200 || true
+          echo "===== qq.log (head)"; docker exec oq sh -c 'head -c 12000 /app/.runtime/qq.log' | cut -c1-300 || true
+          docker rm -f oq >/dev/null 2>&1 || true
+          if [ "$ok" != 1 ]; then echo "::error::the hook never reported bootstrapped"; exit 1; fi
