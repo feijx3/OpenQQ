@@ -106,7 +106,8 @@ ENV NODE_ENV=production \
     OPENQQ_CONFIG=/app/config/openqq.json \
     OPENQQ_QQ_ROOT=/opt/QQ \
     OPENQQ_WEB_PORT=17860 \
-    OPENQQ_WEB_HOST=0.0.0.0 \n    OPENQQ_WS_HOST=0.0.0.0 \
+    OPENQQ_WEB_HOST=0.0.0.0 \
+    OPENQQ_WS_HOST=0.0.0.0 \
     OPENQQ_QQ_NO_SANDBOX=1 \
     OPENQQ_QQ_DISABLE_GPU=1
 
