@@ -98,14 +98,26 @@ class Launcher {
     // Once the initializer is redirected no more breakpoints are needed: detach so QQ never continues its
     // startup under a debugger, then wait for the bootstrap status without debug events.
     void finish(std::chrono::steady_clock::time_point deadline, const std::atomic<bool>& cancelled) {
-        require(DebugActiveProcessStop(process.dwProcessId), "DebugActiveProcessStop");
-        attached = false;
         auto checkExit = [this] {
             if (WaitForSingleObject(process.hProcess, 0) != WAIT_OBJECT_0) return;
             DWORD code = 0;
             GetExitCodeProcess(process.hProcess, &code);
             exited(code);
         };
+        for (int attempt = 0;; ++attempt) {
+            if (DebugActiveProcessStop(process.dwProcessId)) break;
+            DWORD error = GetLastError();
+            checkExit();
+            if (error != ERROR_ACCESS_DENIED || attempt >= 50 || std::chrono::steady_clock::now() >= deadline || cancelled) {
+                SetLastError(error);
+                require(false, "DebugActiveProcessStop");
+            }
+            WaitForSingleObject(process.hProcess, 10);
+            checkExit();
+        }
+        attached = false;
+        // DebugActiveProcessStop closes the debug-event thread handles owned by the system.
+        threads.clear();
         while (std::chrono::steady_clock::now() < deadline && !cancelled) {
             checkExit();
             BootstrapConfig config{};
@@ -321,7 +333,6 @@ public:
                     redirected = true;
                     stage = "running the bootstrap script";
                 }
-                CloseHandle(threads.at(event.dwThreadId));
                 threads.erase(event.dwThreadId);
                 break;
             case LOAD_DLL_DEBUG_EVENT: {
