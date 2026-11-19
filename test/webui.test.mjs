@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { request as httpRequest } from 'node:http';
 import { startWebUI } from '../src/webui.mjs';
+import { recordAction } from '../src/actions.mjs';
 
 async function fixture(t, options = {}) {
   const web = await startWebUI({ port: 0, ...options });
@@ -168,4 +169,34 @@ test('console routes serve the page, fonts are local and /api/metrics reports th
   assert.deepEqual([total('events'), total('actions'), total('errors')], [1, 2, 1]);
   assert.deepEqual([metrics.latency.samples, metrics.latency.average, metrics.latency.last], [2, 21, 30]);
   assert.ok(metrics.process.rss > 0 && metrics.uptime >= 0);
+
+  const mirrored = [];
+  const mockOut = { action: (request, response, source) => mirrored.push({ request, response, source }) };
+  const hugeBytes = 1887437; // 1.8 MiB raw -> ~2.4 MiB base64 (> 2 MiB WebUI limit)
+  const hugeWrappedBase64 = Buffer.alloc(hugeBytes).toString('base64').match(/.{1,76}/g).join('\n');
+  const hugeRequest = { action: 'send_group_msg', params: { group_id: 987654, message: `[CQ:image,file=base64://${hugeWrappedBase64}]` } };
+  const hugeResponse = { status: 'ok', retcode: 0, data: { file: 'cat.png', size: hugeBytes, base64: hugeWrappedBase64 } };
+  const terminalRequest = { action: 'send_private_msg', params: { user_id: 654321, message: [{ type: 'image', data: { file: 'base64://' + hugeWrappedBase64 } }] } };
+
+  recordAction(web, mockOut, { request: hugeRequest, response: { status: 'ok', retcode: 0, data: { message_id: 8 } }, source: 'onebot', elapsed: 40 });
+  recordAction(web, mockOut, { request: { action: 'get_image', params: { file: 'cat.png' } }, response: hugeResponse, source: 'webui', elapsed: 15 });
+  recordAction(web, mockOut, { request: terminalRequest, response: { status: 'ok', retcode: 0, data: { message_id: 9 } }, source: 'terminal', elapsed: 20 });
+
+  assert.equal(hugeRequest.params.message, `[CQ:image,file=base64://${hugeWrappedBase64}]`);
+  assert.equal(hugeResponse.data.base64, hugeWrappedBase64);
+  assert.equal(mirrored.length, 2);
+  assert.equal(mirrored[0].request.params.message, '[CQ:image,file=base64://<1.8 MiB>]');
+  assert.equal(mirrored[0].source, 'onebot');
+  assert.equal(mirrored[1].response.data.base64, '<1.8 MiB>');
+  assert.equal(mirrored[1].source, 'webui');
+
+  const next = await stream(t, web, headers);
+  const snapshot = (await next()).data;
+  assert.equal(snapshot.counts.actions, 5);
+  const [sendEntry, imageEntry, terminalEntry] = snapshot.entries.slice(-3);
+  assert.equal(sendEntry.data.request.params.message, '[CQ:image,file=base64://<1.8 MiB>]');
+  assert.equal(sendEntry.data.response.data.message_id, 8);
+  assert.equal(imageEntry.data.response.data.base64, '<1.8 MiB>');
+  assert.equal(imageEntry.data.response.data.file, 'cat.png');
+  assert.equal(terminalEntry.data.request.params.message[0].data.file, 'base64://<1.8 MiB>');
 });

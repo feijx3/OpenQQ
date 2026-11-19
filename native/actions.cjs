@@ -56,7 +56,7 @@ function segmentsOf(params) {
 function normalizeParams(request) {
   const params = request?.params;
   if (!sendActions.includes(request?.action) || !params || typeof params !== 'object' || Array.isArray(params)) return request;
-  if (typeof params.message !== 'string' || params.auto_escape !== undefined) return request;
+  if (typeof params.message !== 'string' || (params.auto_escape !== undefined && params.auto_escape !== false)) return request;
   return { ...request, params: { ...params, message: parseCQ(params.message) } };
 }
 

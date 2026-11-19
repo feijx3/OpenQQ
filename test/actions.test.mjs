@@ -5,14 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
 import { Readable } from 'node:stream';
-import { once } from 'node:events';
 import nativeActions from '../native/actions.cjs';
 import nativeEvents from '../native/events.cjs';
 import sessionModule from '../native/session.cjs';
 import { createEventConverter } from '../src/onebot.mjs';
 import { createNativeChannel } from '../src/ipc.mjs';
-import { dispatchAction } from '../src/actions.mjs';
+import { dispatchAction, redactActionRequest, redactActionResponse } from '../src/actions.mjs';
 import { parseInput, startCommandInput } from '../src/input.mjs';
+import { startNativeFixture } from './native-support.mjs';
 
 const self = { uin: '123456', uid: 'u_self' };
 const send = (params = {}) => ({ action: 'send_private_msg', params: { user_id: '654321', message: 'hello', ...params } });
@@ -166,26 +166,20 @@ test('IPC rejects pre-connection actions and cancels an in-flight request on dis
   const channel = await createNativeChannel();
   t.after(() => channel.close());
   await assert.rejects(channel.request(send()), error => error.retcode === 1502);
-  const connected = once(channel.events, 'connected');
-  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token }, { NodeIQQNTWrapperSession: { get: () => session } });
-  t.after(() => globalThis.__openqq_hook?.dispose());
   let submitted;
   const submittedPromise = new Promise(resolve => { submitted = resolve; });
-  const session = { init(_config, _a, _b, callbacks) { callbacks.onSessionInitComplete({ result: 0 }); },
-    getMsgService: () => ({ addKernelMsgListener: () => 1, removeKernelMsgListener() {}, generateMsgUniqueId: () => '9007199254740993',
-      sendMsg() { submitted(); return { result: 0 }; } }),
-    getMSFService: () => ({ getServerTime: () => '1794470400' }),
-  };
-  await connected;
-  const ready = new Promise(resolve => channel.events.on('event', event => { if (event.type === 'session_ready') resolve(); }));
-  facade.NodeIQQNTWrapperSession.get().init({ selfUin: self.uin, selfUid: self.uid }, {}, {}, {});
-  await ready;
+  await startNativeFixture(t, {
+    channel,
+    service: {
+      generateMsgUniqueId: () => '9007199254740993',
+      sendMsg() { submitted(); return { result: 0 }; },
+    },
+  });
   const pending = channel.request({ action: 'send_group_msg', params: { group_id: '987654', message: 'mock only' } });
   const cancelled = assert.rejects(pending, error => error.retcode === 1502 && error.message.includes('未确认'));
   await submittedPromise;
   await channel.close();
   await cancelled;
-  globalThis.__openqq_hook?.dispose();
 });
 
 test('terminal parser and line input preserve literal text, echo and continue after bad lines', async () => {
@@ -209,47 +203,39 @@ test('terminal parser and line input preserve literal text, echo and continue af
 });
 
 test('authenticated IPC runs a text send and typing action end-to-end with a shared message ID', async t => {
-  const channel = await createNativeChannel();
-  t.after(() => channel.close());
-  let listener;
   let sends = 0;
   let inputs = 0;
-  const service = {
-    addKernelMsgListener(value) { listener = value; return 1; }, removeKernelMsgListener() {},
-    generateMsgUniqueId: () => '9007199254740993',
-    async sendMsg(_id, peer, elements) {
-      sends++;
-      assert.equal(elements[0].textElement.content, 'test only');
-      queueMicrotask(() => listener.onMsgInfoListUpdate([{ ...peer, senderUin: self.uin, sendStatus: 2, msgId: '9007199254741999' }]));
-      return { result: 0 };
+  const fixture = await startNativeFixture(t, {
+    init: false,
+    service: {
+      generateMsgUniqueId: () => '9007199254740993',
+      async sendMsg(_id, peer, elements) {
+        sends++;
+        assert.equal(elements[0].textElement.content, 'test only');
+        queueMicrotask(() => fixture.getListener().onMsgInfoListUpdate([{ ...peer, senderUin: self.uin, sendStatus: 2, msgId: '9007199254741999' }]));
+        return { result: 0 };
+      },
+      sendShowInputStatusReq(type, event, uid) { assert.deepEqual([type, event, uid], [1, 1, 'u_target']); inputs++; return { result: 0 }; },
     },
-    sendShowInputStatusReq(type, event, uid) { assert.deepEqual([type, event, uid], [1, 1, 'u_target']); inputs++; return { result: 0 }; },
-  };
-  const session = { init(_config, _a, _b, callbacks) { callbacks.onSessionInitComplete({ result: 0 }); },
-    getMsgService: () => service, getMSFService: () => ({ getServerTime: () => '1794470400' }),
-    getUixConvertService: () => ({ getUid: async () => ({ uidInfo: new Map([['654321', 'u_target']]) }) }),
-  };
-  const connected = once(channel.events, 'connected');
-  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token }, { NodeIQQNTWrapperSession: { get: () => session } });
-  t.after(() => globalThis.__openqq_hook?.dispose());
-  await connected;
+    session: {
+      getUixConvertService: () => ({ getUid: async () => ({ uidInfo: new Map([['654321', 'u_target']]) }) }),
+    },
+  });
   const converter = createEventConverter();
-  const notReady = await dispatchAction(channel, converter, { action: 'get_login_info', echo: false });
+  const notReady = await dispatchAction(fixture.channel, converter, { action: 'get_login_info', echo: false });
   assert.equal(notReady.retcode, 1502);
   assert.equal(notReady.echo, false);
-  const ready = new Promise(resolve => channel.events.on('event', event => { if (event.type === 'session_ready') resolve(); }));
-  facade.NodeIQQNTWrapperSession.get().init({ selfUin: self.uin, selfUid: self.uid }, {}, {}, {});
-  await ready;
-  const response = await dispatchAction(channel, converter, { ...send({ message: 'test only' }), echo: { id: '中文' } });
+  await fixture.initialize();
+  const response = await dispatchAction(fixture.channel, converter, { ...send({ message: 'test only' }), echo: { id: '中文' } });
   assert.deepEqual(response, { status: 'ok', retcode: 0, data: { message_id: 1 }, echo: { id: '中文' } });
   const recalled = converter({ type: 'notice', self, time: '1794470400', event: { notice_type: 'friend_recall', user_id: self.uin },
     message: { chatType: 1, peerUid: 'u_target', msgId: '9007199254741999' }, key: 'recall' });
   assert.equal(recalled.message_id, response.data.message_id);
-  const typing = await dispatchAction(channel, converter, { action: 'set_input_status', params: { user_id: '654321', event_type: 1 } });
+  const typing = await dispatchAction(fixture.channel, converter, { action: 'set_input_status', params: { user_id: '654321', event_type: 1 } });
   assert.equal(typing.status, 'ok');
   assert.equal(sends, 1);
   assert.equal(inputs, 1);
-  assert.equal((await dispatchAction(channel, converter, { action: 'unknown', echo: null })).retcode, 1404);
+  assert.equal((await dispatchAction(fixture.channel, converter, { action: 'unknown', echo: null })).retcode, 1404);
 });
 
 test('get_image validates parameters, resolves received images via IPC and enriches with url and base64', async t => {
@@ -259,38 +245,22 @@ test('get_image validates parameters, resolves received images via IPC and enric
   const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   await writeFile(picPath, bytes);
 
-  const channel = await createNativeChannel();
-  t.after(() => channel.close());
-  let listener;
-  const service = {
-    addKernelMsgListener(value) { listener = value; return 1; },
-    removeKernelMsgListener() {},
-  };
-  const session = {
-    init(_config, _a, _b, callbacks) { callbacks.onSessionInitComplete({ result: 0 }); },
-    getMsgService: () => service,
-    getUixConvertService: () => ({ getUid: async () => ({ uidInfo: new Map() }) }),
-  };
-  const connected = once(channel.events, 'connected');
-  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token }, { NodeIQQNTWrapperSession: { get: () => session } });
-  t.after(() => globalThis.__openqq_hook?.dispose());
-  await connected;
-  const ready = new Promise(resolve => channel.events.on('event', event => { if (event.type === 'session_ready') resolve(); }));
-  facade.NodeIQQNTWrapperSession.get().init({ selfUin: self.uin, selfUid: self.uid }, {}, {}, {});
-  await ready;
+  const fixture = await startNativeFixture(t, {
+    session: { getUixConvertService: () => ({ getUid: async () => ({ uidInfo: new Map() }) }) },
+  });
 
   const converter = createEventConverter();
-  assert.equal((await dispatchAction(channel, converter, { action: 'get_image', params: {} })).retcode, 1400);
-  assert.equal((await dispatchAction(channel, converter, { action: 'get_image', params: { file: 'missing.png' } })).retcode, 1404);
+  assert.equal((await dispatchAction(fixture.channel, converter, { action: 'get_image', params: {} })).retcode, 1400);
+  assert.equal((await dispatchAction(fixture.channel, converter, { action: 'get_image', params: { file: 'missing.png' } })).retcode, 1404);
 
-  const delivered = new Promise(resolve => channel.events.on('event', event => { if (event.type === 'message') resolve(); }));
-  listener.onRecvMsg([{
+  const delivered = new Promise(resolve => fixture.channel.events.on('event', event => { if (event.type === 'message') resolve(); }));
+  fixture.getListener().onRecvMsg([{
     chatType: 1, msgId: '501', msgTime: '1794470400', peerUid: 'u_other', peerUin: '654321', senderUid: 'u_other', senderUin: '654321',
     elements: [{ elementType: 2, elementId: '901', picElement: { fileName: 'cat.png', md5HexStr: 'deadbeef', fileUuid: 'uuid-cat', fileSize: String(bytes.length), sourcePath: picPath } }],
   }]);
   await delivered;
 
-  const res = await dispatchAction(channel, converter, { action: 'get_image', params: { file: 'cat.png' }, echo: 'img-1' }, {
+  const res = await dispatchAction(fixture.channel, converter, { action: 'get_image', params: { file: 'cat.png' }, echo: 'img-1' }, {
     mediaUrl: (p, f) => `http://127.0.0.1:3001/openqq/media/id/${f}`,
   });
   assert.equal(res.status, 'ok');
@@ -300,5 +270,57 @@ test('get_image validates parameters, resolves received images via IPC and enric
   assert.equal(res.data.url, 'http://127.0.0.1:3001/openqq/media/id/cat.png');
 
   assert.equal(typeof nativeEvents.createEventReceiver, 'function');
-  globalThis.__openqq_hook?.dispose();
+});
+
+test('redactActionRequest replaces base64:// and data: URIs with size placeholders without mutating the request', () => {
+  const payload = Buffer.alloc(1500).toString('base64');
+  const wrappedPayload = payload.match(/.{1,76}/g).join('\r\n');
+  const original = {
+    action: 'send_group_msg',
+    params: {
+      group_id: 987654,
+      message: [
+        { type: 'image', data: { file: 'base64://' + payload, summary: '[图]' } },
+        { type: 'video', data: { file: 'C:\\clip.mp4', thumb: 'data:image/png;base64,' + wrappedPayload } },
+        { type: 'text', data: { text: 'base64://' + payload } },
+      ],
+    },
+  };
+  const redacted = redactActionRequest(original);
+  assert.equal(redacted.params.message[0].data.file, 'base64://<1.5 KiB>');
+  assert.equal(redacted.params.message[0].data.summary, '[图]');
+  assert.equal(redacted.params.message[1].data.file, 'C:\\clip.mp4');
+  assert.equal(redacted.params.message[1].data.thumb, 'data:image/png;base64,<1.5 KiB>');
+  assert.equal(redacted.params.message[2].data.text, 'base64://' + payload);
+  assert.equal(original.params.message[0].data.file, 'base64://' + payload);
+
+  const cq = redactActionRequest({
+    action: 'send_msg',
+    params: {
+      user_id: 654321,
+      auto_escape: false,
+      message: `base64://AAAA hello [CQ:face,id=1][CQ:image,file=base64://${wrappedPayload},summary=x][CQ:record,file=data:audio/wav;base64&#44;${wrappedPayload}]`,
+    },
+  });
+  assert.equal(
+    cq.params.message,
+    'base64://AAAA hello [CQ:face,id=1][CQ:image,file=base64://<1.5 KiB>,summary=x][CQ:record,file=data:audio/wav;base64&#44;<1.5 KiB>]',
+  );
+
+  const literal = { action: 'send_private_msg', params: { user_id: 654321, message: `[CQ:image,file=base64://${payload}]`, auto_escape: true } };
+  assert.equal(redactActionRequest(literal), literal);
+});
+
+test('redactActionResponse replaces data.base64 with a size placeholder without mutating the response', () => {
+  const encoded = Buffer.alloc(1500).toString('base64');
+  const original = { status: 'ok', retcode: 0, data: { file: 'cat.png', size: 1500, base64: encoded } };
+  const redacted = redactActionResponse(original);
+  assert.equal(redacted.data.base64, '<1.5 KiB>');
+  assert.equal(redacted.data.file, 'cat.png');
+  assert.equal(original.data.base64, encoded);
+
+  const plain = { status: 'ok', retcode: 0, data: { message_id: 1 } };
+  assert.equal(redactActionResponse(plain), plain);
+  const failed = { status: 'failed', retcode: 1404, data: null, message: 'missing' };
+  assert.equal(redactActionResponse(failed), failed);
 });

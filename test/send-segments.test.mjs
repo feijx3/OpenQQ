@@ -1,14 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import nativeActions from '../native/actions.cjs';
 import cq from '../native/cq.cjs';
 import { createEventConverter } from '../src/onebot.mjs';
+import { createMediaPreparer } from '../src/media.mjs';
 import { dispatchAction } from '../src/actions.mjs';
+import { startNativeFixture } from './native-support.mjs';
 
 const self = { uin: '123456', uid: 'u_self' };
 const md5 = bytes => createHash('md5').update(bytes).digest('hex');
@@ -73,9 +75,14 @@ test('CQ codes decode escapes, keep malformed codes as text and round-trip throu
 test('string messages are parsed as CQ code unless auto_escape is set', () => {
   const converted = nativeActions.normalizeParams({ action: 'send_group_msg', params: { group_id: 1, message: 'a &amp; b [CQ:at,qq=all]' } });
   assert.deepEqual(converted.params.message, [{ type: 'text', data: { text: 'a & b ' } }, { type: 'at', data: { qq: 'all' } }]);
+  const explicitFalse = nativeActions.normalizeParams({ action: 'send_group_msg', params: { group_id: 1, message: 'a [CQ:at,qq=all]', auto_escape: false } });
+  assert.deepEqual(explicitFalse.params.message, [{ type: 'text', data: { text: 'a ' } }, { type: 'at', data: { qq: 'all' } }]);
   const literal = { action: 'send_group_msg', params: { group_id: 1, message: '[CQ:at,qq=all]', auto_escape: true } };
   assert.equal(nativeActions.normalizeParams(literal), literal);
   assert.deepEqual(nativeActions.validateAction(literal).texts, ['[CQ:at,qq=all]']);
+  const nonBoolean = { action: 'send_group_msg', params: { group_id: 1, message: '[CQ:at,qq=all]', auto_escape: null } };
+  assert.equal(nativeActions.normalizeParams(nonBoolean), nonBoolean);
+  assert.throws(() => nativeActions.validateAction(nonBoolean), /auto_escape 必须为布尔值/);
   const array = { action: 'send_group_msg', params: { group_id: 1, message: [{ type: 'text', data: { text: 'x' } }] } };
   assert.equal(nativeActions.normalizeParams(array), array);
   assert.equal(nativeActions.normalizeParams({ action: 'get_status' }).action, 'get_status');
@@ -232,4 +239,103 @@ test('dispatchAction normalizes CQ strings, prepares media, lengthens the IPC wa
   assert.deepEqual((await dispatchAction(channel, converter, { action: 'can_send_image' })).data, { yes: true });
   assert.deepEqual((await dispatchAction(channel, converter, { action: 'can_send_record' })).data, { yes: true });
   assert.equal(calls.length, 1);
+});
+
+test('dispatchAction sends >1 MiB base64:// payloads across media types, CQ strings and send actions', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'openqq-ipc-media-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const temp = join(root, 'temp');
+  let serial = 9007199254742000n;
+  const sends = [];
+  const nativeFixture = await startNativeFixture(t, {
+    service: {
+      generateMsgUniqueId: () => String(serial++),
+      getRichMediaFilePathForGuild(request) { return join(root, 'QQ', String(request.elementType), request.md5HexStr + extname(request.fileName)); },
+      async sendMsg(_id, peer, elements) {
+        sends.push({ peer, elements });
+        const msgId = String(serial++);
+        queueMicrotask(() => nativeFixture.getListener().onMsgInfoListUpdate([{ ...peer, senderUin: self.uin, sendStatus: 2, msgId }]));
+        return { result: 0 };
+      },
+    },
+    session: {
+      getUixConvertService: () => ({ getUid: async uins => ({ uidInfo: new Map(uins.map(uin => [uin, 'u_' + uin])) }) }),
+    },
+  });
+
+  const bigPng = (size = 800 * 1024) => {
+    const b = Buffer.alloc(size);
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(b);
+    b.writeUInt32BE(13, 8); b.write('IHDR', 12, 'latin1'); b.writeUInt32BE(64, 16); b.writeUInt32BE(32, 20);
+    b[24] = 8; b[25] = 6;
+    return b;
+  };
+  const bigSilk = () => Buffer.concat([Buffer.from('#!SILK_V3'), ...Array.from({ length: 40000 }, () => Buffer.from([20, 0, ...Buffer.alloc(20)])), Buffer.from([0xff, 0xff])]);
+  const box = (type, ...children) => {
+    const body = Buffer.concat(children);
+    const b = Buffer.alloc(8 + body.length);
+    b.writeUInt32BE(b.length, 0); b.write(type, 4, 'latin1'); body.copy(b, 8);
+    return b;
+  };
+  const bigMp4 = () => {
+    const tkhd = Buffer.alloc(84); tkhd.writeUInt32BE(1280 * 65536, 76); tkhd.writeUInt32BE(720 * 65536, 80);
+    const hdlr = Buffer.alloc(24); hdlr.write('vide', 8, 'latin1');
+    const mvhd = Buffer.alloc(100); mvhd.writeUInt32BE(1000, 12); mvhd.writeUInt32BE(5000, 16);
+    return Buffer.concat([box('ftyp', Buffer.from('isom'), Buffer.alloc(8)), box('mdat', Buffer.alloc(800 * 1024)), box('moov', box('mvhd', mvhd), box('trak', box('tkhd', tkhd), box('mdia', box('hdlr', hdlr))))]);
+  };
+
+  const pngBytes = bigPng();
+  const silkBytes = bigSilk();
+  const mp4Bytes = bigMp4();
+  const thumbBytes = bigPng();
+  const fileBytes = Buffer.alloc(800 * 1024, 0x41);
+  const b64 = buf => {
+    const encoded = buf.toString('base64');
+    assert.ok(Buffer.byteLength(encoded) > 1024 * 1024);
+    return 'base64://' + encoded;
+  };
+
+  const cases = [
+    {
+      name: 'image array via send_group_msg',
+      request: group([{ type: 'image', data: { file: b64(pngBytes), summary: '[大图]', extra: 'x'.repeat(100) } }]),
+      verify: sent => { assert.equal(sent.peer.chatType, 2); assert.equal(sent.elements[0].picElement.fileSize, pngBytes.length); assert.equal(sent.elements[0].picElement.summary, '[大图]'); },
+    },
+    {
+      name: 'image CQ string via send_group_msg',
+      request: group(`[CQ:image,file=${b64(pngBytes)},summary=&#91;CQ&#93;]`),
+      verify: sent => { assert.equal(sent.peer.chatType, 2); assert.equal(sent.elements[0].picElement.fileSize, pngBytes.length); assert.equal(sent.elements[0].picElement.summary, '[CQ]'); },
+    },
+    {
+      name: 'image CQ string with auto_escape: false via send_group_msg',
+      request: { action: 'send_group_msg', params: { group_id: '555000', message: `[CQ:image,file=${b64(pngBytes)}]`, auto_escape: false } },
+      verify: sent => { assert.equal(sent.peer.chatType, 2); assert.equal(sent.elements[0].picElement.fileSize, pngBytes.length); },
+    },
+    {
+      name: 'record via send_private_msg',
+      request: { action: 'send_private_msg', params: { user_id: '654321', message: [{ type: 'record', data: { file: b64(silkBytes) } }] } },
+      verify: sent => { assert.equal(sent.peer.chatType, 1); assert.equal(sent.elements[0].pttElement.fileSize, String(silkBytes.length)); },
+    },
+    {
+      name: 'video + thumb via send_msg (group)',
+      request: { action: 'send_msg', params: { group_id: '555000', message: [{ type: 'video', data: { file: b64(mp4Bytes), thumb: b64(thumbBytes), name: 'clip.mp4' } }] } },
+      verify: sent => { assert.equal(sent.peer.chatType, 2); assert.equal(sent.elements[0].videoElement.fileSize, String(mp4Bytes.length)); assert.equal(sent.elements[0].videoElement.thumbSize, thumbBytes.length); },
+    },
+    {
+      name: 'file via send_msg (private)',
+      request: { action: 'send_msg', params: { user_id: '654321', message: [{ type: 'file', data: { file: b64(fileBytes), name: 'report.bin' } }] } },
+      verify: sent => { assert.equal(sent.peer.chatType, 1); assert.equal(sent.elements[0].fileElement.fileName, 'report.bin'); assert.equal(sent.elements[0].fileElement.fileSize, String(fileBytes.length)); },
+    },
+  ];
+
+  const converter = createEventConverter();
+  const preparer = createMediaPreparer({ dir: temp });
+  for (const item of cases) {
+    const before = sends.length;
+    const response = await dispatchAction(nativeFixture.channel, converter, item.request, { media: preparer });
+    assert.equal(response.status, 'ok', item.name);
+    assert.equal(sends.length, before + 1, item.name);
+    item.verify(sends[before]);
+    assert.deepEqual(await readdir(temp), [], item.name + ' releases temporary files');
+  }
 });

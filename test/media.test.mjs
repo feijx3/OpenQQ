@@ -110,18 +110,22 @@ test('images and files resolve from local paths, file:// URLs and base64, and lo
   const media = createMediaPreparer({ dir: w.temp });
   const image = await w.put('pic.png', png(64, 32));
   const prepared = await media.prepare({ message: [
-    { type: 'image', data: { file: image } },
+    { type: 'image', data: { file: image, extra: 'drop me' } },
     { type: 'image', data: { file: pathToFileURL(image).href } },
-    { type: 'image', data: { file: 'base64://' + png(10, 20).toString('base64'), summary: '[图]' } },
+    { type: 'image', data: { file: 'base64://' + png(10, 20).toString('base64'), summary: 's'.repeat(80) } },
     { type: 'image', data: { file: 'data:image/png;base64,' + png(12, 16).toString('base64') } },
     { type: 'text', data: { text: 'keep me' } },
   ] });
   const [local, url, inline, dataUri, text] = prepared.params.message;
   assert.deepEqual([local.data.openqq_media.kind, local.data.openqq_media.format, local.data.openqq_media.width, local.data.openqq_media.height, local.data.openqq_media.path], ['image', 'png', 64, 32, image]);
+  assert.deepEqual(Object.keys(local.data), ['openqq_media']);
   assert.equal(url.data.openqq_media.path.toLowerCase(), image.toLowerCase());
   assert.equal(inline.data.openqq_media.width, 10);
   assert.notEqual(inline.data.openqq_media.path, image);
-  assert.equal(inline.data.summary, '[图]');
+  assert.equal(inline.data.summary, 's'.repeat(64));
+  assert.deepEqual(Object.keys(inline.data).sort(), ['openqq_media', 'summary']);
+  assert.deepEqual(Object.keys(url.data), ['openqq_media']);
+  assert.deepEqual(Object.keys(dataUri.data), ['openqq_media']);
   assert.equal(dataUri.data.openqq_media.width, 12);
   assert.deepEqual(text, { type: 'text', data: { text: 'keep me' } });
   assert.equal((await readdir(w.temp)).length, 2);
@@ -130,8 +134,9 @@ test('images and files resolve from local paths, file:// URLs and base64, and lo
   assert.ok((await stat(image)).isFile(), 'the caller\'s own file is untouched');
 
   const document = await w.put('report.txt', 'hello');
-  const file = await media.prepare({ message: [{ type: 'file', data: { file: document, name: 'a/b/报告.txt' } }] });
+  const file = await media.prepare({ message: [{ type: 'file', data: { file: document, name: 'a/b/报告.txt', extra: 'drop me' } }] });
   assert.deepEqual([file.params.message[0].data.openqq_media.name, file.params.message[0].data.openqq_media.size], ['报告.txt', 5]);
+  assert.deepEqual(Object.keys(file.params.message[0].data), ['openqq_media']);
 });
 
 test('sources that are not a plain local file, a data URI or an http(s) URL are refused', async t => {
@@ -252,6 +257,7 @@ test('video needs a cover: an explicit thumb works, otherwise ffmpeg or a clear 
   const info = prepared.params.message[0].data.openqq_media;
   assert.deepEqual([info.kind, info.format, info.width, info.height, info.duration, info.name, info.path], ['video', 'mp4', 1280, 720, 5, 'clip.mp4', video]);
   assert.deepEqual([info.thumb.width, info.thumb.height, info.thumb.format], [320, 180, 'jpeg']);
+  assert.deepEqual(Object.keys(prepared.params.message[0].data), ['openqq_media']);
   await prepared.release();
   assert.deepEqual(await readdir(w.temp), [], 'the generated cover is removed, the video is not copied');
 });
