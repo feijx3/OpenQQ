@@ -116,6 +116,18 @@ function validateAction(request) {
   const params = request.params ?? {};
   if (!params || typeof params !== 'object' || Array.isArray(params)) throw fail('params 必须为对象');
   if (['get_login_info', 'get_status'].includes(request.action)) return { kind: request.action };
+  if (request.action === 'sso_pipe_status') return { kind: 'sso_pipe', action: 'sso_pipe_status' };
+  if (request.action === 'sso_pipe_send') {
+    const cmd = String(params.cmd ?? '').trim();
+    if (!cmd) throw fail('sso_pipe_send 需要 cmd', 1400);
+    if (cmd.length > 200) throw fail('sso_pipe_send 的 cmd 太长（>200）', 1400);
+    const hex = String(params.hex ?? params.body_hex ?? '').replace(/\s+/g, '');
+    if (hex && !/^[0-9a-fA-F]+$/.test(hex)) throw fail('sso_pipe_send 的 hex 不是合法十六进制', 1400);
+    if (hex.length % 2 !== 0) throw fail('sso_pipe_send 的 hex 长度必须是偶数', 1400);
+    if (hex.length / 2 > 16 * 1024 * 1024) throw fail('sso_pipe_send 的 body 超过 16MB', 1400);
+    return { kind: 'sso_pipe', action: 'sso_pipe_send', cmd, body: Buffer.from(hex, 'hex') };
+  }
+
   if (request.action === 'set_input_status') {
     if (!Number.isInteger(params.event_type) || params.event_type < 0 || params.event_type > 0x7fffffff) throw fail('event_type 必须是非负 int32');
     return { kind: 'input', target: identifier(params.user_id, 'user_id'), eventType: params.event_type };
@@ -155,6 +167,95 @@ function createActionHandler(session, self, current, options = {}) {
   const operations = new Set();
   const waiting = new Map();
   let disposed = false;
+
+  // ── 自研 SSO 发包（不依赖任何第三方注入组件）─────────────────────────
+  // bootstrap 在 QQ 进程内把一次 std::string 构造的跳转目标改到我们这（4 字节 + 12 字节跳板），
+  // 我们只负责告诉它"这一次 body 用我的字节"（arm），然后调 QQ 自己的
+  // Msg.sendSsoCmdReqByContend —— 包由 QQ 发、回包也由 QQ 收，不做任何内存扫描。
+  // 同一条命令在两个服务名前缀下可达性不同（有的会静默丢包），空回包时换另一个前缀再试一次。
+  async function selfSsoSend(cmd, bodyBuf) {
+    const armFn = globalThis.__openqqSsoBodyConv;
+    if (typeof armFn !== 'function') {
+      return { ok: false, status: -1, note: '__openqqSsoBodyConv 不存在：需要新 bootstrap' };
+    }
+    const st = armFn('status', '');
+    if (!st || !st.patched) {
+      return { ok: false, status: -1, note: 'body 代劳补丁未安装（bootstrap 启动时应自动装；失败说明 wrapper.node 版本不符）' };
+    }
+    const bytes = Buffer.isBuffer(bodyBuf) ? bodyBuf : Buffer.from(bodyBuf || []);
+
+    const once = async (name) => {
+      const arm = armFn('arm', bytes.toString('hex'));
+      if (!arm || !arm.ok) return { ok: false, status: -1, note: 'arm 失败：' + JSON.stringify(arm || null) };
+      const t0 = Date.now();
+      let res;
+      try {
+        const svc = session.getMsgService();
+        // 占位串只用来触发转换，内容随后由 native 覆盖成真 body。
+        res = await Promise.resolve(svc.sendSsoCmdReqByContend(name, 'A'.repeat(bytes.length || 1)));
+      } catch (error) {
+        return { ok: false, status: -1, ms: Date.now() - t0,
+          note: 'sendSsoCmdReqByContend 抛错：' + String((error && error.message) || error).slice(0, 180) };
+      }
+      const ms = Date.now() - t0;
+
+      let resp = Buffer.alloc(0);
+      if (res instanceof Uint8Array) resp = Buffer.from(res);
+      else if (typeof res === 'string') resp = Buffer.from(res, 'latin1');
+      else if (res && typeof res === 'object') {
+        const raw = res.rsp ?? res.body ?? res.data;
+        if (raw instanceof Uint8Array) resp = Buffer.from(raw);
+        else if (typeof raw === 'string') resp = Buffer.from(raw, 'latin1');
+      }
+
+      // 解 OidbBase：1=command 2=subCommand 3=errorCode 4=body 5=errorMsg
+      const ob = {};
+      {
+        let i = 0;
+        const rv = () => { let v = 0n, s = 0n, c; do { if (i >= resp.length) throw new Error('eof'); c = resp[i++]; v |= BigInt(c & 0x7f) << s; s += 7n; } while (c & 0x80); return v; };
+        while (i < resp.length) {
+          let t; try { t = Number(rv()); } catch { break; }
+          const field = t >>> 3, wire = t & 7;
+          if (wire === 0) { try { ob[field] = Number(rv()); } catch { break; } }
+          else if (wire === 2) { const n = Number(rv()); ob[field] = resp.subarray(i, i + n); i += n; }
+          else if (wire === 5) i += 4;
+          else if (wire === 1) i += 8;
+          else break;
+        }
+      }
+      // ⚠️ proto3 省略零值：errorCode==0 时 field3 根本不存在，不能拿 -1 当失败。
+      // 另外 trpc 回包（群相册那类）没有 OidbBase 外壳，field3 可能是 bytes 而不是 varint ——
+      // 这时它不是错误码，按 0 处理，否则会把成功显示成 errorCode=[object Object]。
+      const errorCode = typeof ob[3] === 'number' ? ob[3] : 0;
+      return {
+        ok: errorCode === 0 && resp.length > 0,
+        status: errorCode,
+        errorCode,
+        // field4 在正常回包里是 bytes，但也见过是 varint 的（这时 ob[4] 是 Number）。
+        // 统一成 Buffer，否则下游 .subarray/.length 会抛（get_pskey 就因此报过
+        // `body.subarray is not a function`）。
+        body: Buffer.isBuffer(ob[4]) ? ob[4] : Buffer.alloc(0),
+        errorMsg: ob[5] ? Buffer.from(ob[5]).toString('utf8') : '',
+        response: resp,
+        ms,
+        cmdUsed: name,
+        note: resp.length ? '' : '空回包',
+      };
+    };
+
+    const first = await once(cmd);
+    // 有回包（哪怕是业务错误码）就用它 —— 那是服务端的真实答复。
+    if (first.response && first.response.length) return first;
+    // arm 都失败（补丁没装等）就没必要重试第二个前缀。
+    if (!first.ms && first.status === -1) return first;
+    const alt = altSsoCmdName(cmd);
+    if (!alt) return first;
+    const second = await once(alt);
+    if (second.response && second.response.length) {
+      return { ...second, fallbackFrom: cmd, note: '' };
+    }
+    return { ...first, note: '两个前缀都没回包（' + cmd + ' / ' + alt + '）' };
+  }
 
   function observe(name, args) {
     const records = name === 'onMsgInfoListUpdate' ? args[0] : name === 'onAddSendMsg' ? [args[0]] : [];
@@ -222,7 +323,32 @@ function createActionHandler(session, self, current, options = {}) {
     };
     try {
       return await Promise.race([cancelled, (async () => {
-        if (action.kind === 'get_login_info') return { user_id: Number(self.uin), nickname: '' };
+        if (action.kind === 'sso_pipe') {
+      // 判据：status 0 + 有 body = 服务端真回了；status 非 0 时 note 是服务端原文。
+      if (action.action === 'sso_pipe_status') {
+        // 探活 = 问一次补丁装没装。装上了才算通道就绪。
+        const armFn = globalThis.__openqqSsoBodyConv;
+        const st = typeof armFn === 'function' ? (armFn('status', '') || {}) : { patched: false };
+        const ok = Boolean(st && st.patched);
+        return {
+          status: ok ? 'ok' : 'failed', retcode: ok ? 0 : 1500,
+          data: { channel: 'self', patched: Boolean(st && st.patched), ...st },
+          ...(ok ? {} : { message: 'body 代劳补丁未安装：需要配套的 openqq-bootstrap（wrapper.node 版本不符时会装不上）' }),
+        };
+      }
+      // 失败用 throw 表达：调用方那一层（session.cjs）只在 reject 时才写 retcode，
+      // 返回 {status:'failed'} 会被当成成功包进 data 里，调用方看不出错。
+      const r = await selfSsoSend(action.cmd, action.body);
+      if (r.status !== 0) throw fail(r.note || ('SSO 发送失败，status=' + r.status), 1500);
+      if (!r.body || !r.body.length) throw fail(r.note || '服务端没有回包（命令名或前缀可能不对）', 1500);
+      return {
+        cmd: action.cmd,
+        status: r.status,
+        responseLen: r.body.length,
+        responseHex: r.body.subarray(0, 65536).toString('hex'),
+      };
+    }
+    if (action.kind === 'get_login_info') return { user_id: Number(self.uin), nickname: '' };
         if (action.kind === 'get_status') return { online: true, good: true };
         if (action.kind === 'forward') {
           if (typeof options.expandForward !== 'function') throw fail('当前会话不支持获取合并转发', 1500);
