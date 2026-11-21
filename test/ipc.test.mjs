@@ -47,7 +47,7 @@ test('native channel closes oversized unauthenticated frames', async t => {
   await closed;
 });
 
-test('native payload connects without Inspector and restores methods when IPC closes', async t => {
+test('native payload connects without Inspector, keeps the hook across a reconnect and restores methods on dispose', async t => {
   const channel = await createNativeChannel();
   t.after(() => channel.close());
   const session = { init() {} };
@@ -64,7 +64,14 @@ test('native payload connects without Inspector and restores methods when IPC cl
   assert.equal(factory.create, original);
   facade.NodeIQQNTWrapperSession.create();
   assert.notEqual(session.init, originalInit);
+  // 固定端点意味着 IPC 断开后 QQ 侧会重连，所以包装保持原位 —— 这正是"重启 OpenQQ 不用重启 QQ"的前提。
   await channel.close();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.notEqual(facade.NodeIQQNTWrapperSession.create, original);
+  assert.notEqual(session.init, originalInit);
+  assert.equal(globalThis.__openqq_hook !== undefined, true);
+  // 只有显式 dispose 才把包装撤掉并还原原始方法。
+  globalThis.__openqq_hook?.dispose();
   await new Promise(resolve => setTimeout(resolve, 30));
   assert.equal(factory.create, original);
   assert.equal(session.init, originalInit);

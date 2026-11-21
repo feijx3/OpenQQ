@@ -1,12 +1,12 @@
 import { parseArgs } from 'node:util';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, renameSync, readFileSync, createWriteStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { join, dirname, resolve } from 'node:path';
 import { inspectQQ, resolveLinuxWrapper, bootstrapInput, verifiedVersions } from './qq.mjs';
 import { detectEnvironment, isQQProcessRunning, probeNative } from './env.mjs';
-import { createNativeChannel } from './ipc.mjs';
+import { createNativeChannel, ensureIpcParams } from './ipc.mjs';
 import { createEventConverter } from './onebot.mjs';
 import { createIdStore } from './idstore.mjs';
 import { dispatchAction, redactRequest, redactResponse } from './actions.mjs';
@@ -22,6 +22,23 @@ import { createAIClient } from './bot/ai.mjs';
 import { createImageClient } from './bot/image.mjs';
 import { createBotEngine } from './bot/engine.mjs';
 import { createBotApi } from './bot/api.mjs';
+
+// 运行中的 QQ 里有没有我们的原生模块。QQ 允许多开、各账号分区独立，所以机器上同时开着
+// 别的账号的 QQ 是正常情况——那不是"附着失败"，而是"该另起一个实例"。
+// 查不出来时按"是我们的"处理，保持原来更保守的行为。
+function runningQQIsOurs() {
+  if (process.platform !== 'win32') return true;
+  try {
+    const ps = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const out = execFileSync(ps, [
+      '-NoProfile', '-NonInteractive', '-Command',
+      "Get-Process QQ -ErrorAction SilentlyContinue | ForEach-Object { try { if ($_.Modules | Where-Object { $_.ModuleName -like '*openqq-bootstrap*' }) { 'openqq' } } catch {} }",
+    ], { encoding: 'utf8', windowsHide: true, timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] });
+    return String(out).includes('openqq');
+  } catch {
+    return true;
+  }
+}
 
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const runtimeDir = join(projectDir, '.runtime');
@@ -75,7 +92,8 @@ function checkClient(qq) {
   }
   const native = probeNative(projectDir);
   if (!native.ready) throw new Error(native.error);
-  if (isQQProcessRunning()) throw new Error('请先手动退出 QQ，再由 OpenQQ 在原生模块加载前启动挂接');
+  // 这里不判断 QQ 是否在运行：在运行也可能是一个已经注入了原生脚本的实例，那样只需附着。
+  // 到底能不能附着由 start() 里「等它连回固定端点」这一步决定，失败时再给出退出 QQ 的提示。
   return native;
 }
 
@@ -86,12 +104,44 @@ function oneBotAccess(config) {
   return parts.join(' · ') + (config.ws.enabled || config.http?.enabled ? '（令牌见 WebUI 接入配置）' : '：QQ 就绪后连接');
 }
 
+// ipc.json 的读取与生成在 src/ipc.mjs（ensureIpcParams）：端点名是随机的，只持久化复用，
+// 不由项目路径推导。这样同一份安装下次启动仍落到同一地址，别的进程却猜不到名字。
+
 async function start(qq, config, existingWebUI) {
   const native = checkClient(qq);
   if (!qq.targetMatch) {
     out.log('warn', `当前 QQ 版本 ${qq.version} 未经过完整实机验证（已验证版本：${verifiedVersions.join('、')}），如遇异常请查看运行诊断`);
   }
-  const channel = await createNativeChannel();
+  let current = { phase: 'starting', version: qq.version, bootstrap: 'cpp-native' };
+  const ipcParams = ensureIpcParams(runtimeDir);
+  const channel = await createNativeChannel(ipcParams.pipe, ipcParams.token);
+  // 优先附着：QQ 已在运行、且里面那份原生脚本还在（它会自己连回固定端点）时，等它连回来，完全不碰 QQ。
+  // 连不回来就说明那个 QQ 不是我们注入的实例。这时既不能附着，也不能再拉一个启动器（会往一个已经
+  // 跑着的 QQ 里重复注入），只能请用户先退出 QQ —— 也就是改造前那条原始错误的含义。
+  let attached = false;
+  if (isQQProcessRunning()) {
+    out.log('info', '检测到 QQ 正在运行，尝试直接附着（不重启 QQ）…');
+    attached = await new Promise(resolve => {
+      const timer = setTimeout(() => resolve(false), 6000);
+      channel.events.once('connected', info => {
+        clearTimeout(timer);
+        current = { ...current, phase: 'hook_installed', pid: info.pid };
+        resolve(true);
+      });
+    });
+    if (!attached) {
+      // 附着不上有两种完全不同的原因，不能一律报"请先退出 QQ"：
+      //  · 运行中的 QQ 里装着我们的原生模块 → 那是同一个实例但端点没连回来（真异常）。
+      //  · 运行中的 QQ 是另一个账号（QQ 允许多开，各账号分区独立）→ 它根本不是我们的目标，
+      //    另起一个实例才是对的。多账号机器上很常见，不该要求用户把自己的 QQ 关掉。
+      if (runningQQIsOurs()) {
+        await channel.close();
+        throw new Error('请先手动退出 QQ，再由 OpenQQ 在原生模块加载前启动挂接');
+      }
+      out.log('info', '运行中的 QQ 不是 OpenQQ 注入的实例（另一个账号），将以独立实例启动');
+    }
+    if (attached) out.log('info', '已附着到运行中的 QQ（QQ 没有被重启）');
+  }
   let network;
   // message_id values survive a restart: the mapping to QQ's own ids is kept in .runtime/ids.json.
   const convert = createEventConverter({ mediaUrl: (filePath, fileName) => network?.mediaUrl(filePath, fileName) ?? null,
@@ -99,7 +149,6 @@ async function start(qq, config, existingWebUI) {
   // Sources of image / voice / video / file segments (local path, base64, URL) are fetched into this folder before sending.
   const media = createMediaPreparer({ dir: join(runtimeDir, 'media') });
   media.sweep().catch(() => {});
-  let current = { phase: 'starting', version: qq.version, bootstrap: 'cpp-native' };
   let webui;
   const execute = async (request, source) => {
     const started = performance.now();
@@ -187,26 +236,29 @@ async function start(qq, config, existingWebUI) {
   });
   channel.events.once('disconnected', finish);
   channel.events.on('failure', reject);
-  const driverEnv = values['no-sandbox'] ? { ...process.env, OPENQQ_QQ_NO_SANDBOX: '1' } : process.env;
-  const driver = spawn(native.launcher, [], {
-    windowsHide: true, env: driverEnv, stdio: ['pipe', 'pipe', 'pipe'],
-  });
-  const wrapper = resolveLinuxWrapper(qq);
-  // Keep IPC token and pipe path out of process command-line arguments.
-  driver.stdin.write(bootstrapInput({ executable: qq.executable, wrapper, dll: native.dll,
-    payload: join(projectDir, 'native/session.cjs'), pipe: channel.path, token: channel.token }));
-  // QQ inherits the bootstrap's stdio, so its own console output arrives here as well: keep all of it in
-  // .runtime/qq.log and show only OpenQQ's bootstrap stages (QQ lines appear with /verbose).
-  for (const stream of [driver.stdout, driver.stderr]) {
-    stream.on('data', chunk => { if (!qqLog.writableEnded) qqLog.write(chunk); });
-    createInterface({ input: stream, crlfDelay: Infinity }).on('line', line => out.native(line));
+  let driver = null;
+  if (!attached) {
+    const driverEnv = values['no-sandbox'] ? { ...process.env, OPENQQ_QQ_NO_SANDBOX: '1' } : process.env;
+    driver = spawn(native.launcher, [], {
+      windowsHide: true, env: driverEnv, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const wrapper = resolveLinuxWrapper(qq);
+    // Keep IPC token and pipe path out of process command-line arguments.
+    driver.stdin.write(bootstrapInput({ executable: qq.executable, wrapper, dll: native.dll,
+      payload: join(projectDir, 'native/session.cjs'), pipe: channel.path, token: channel.token }));
+    // QQ inherits the bootstrap's stdio, so its own console output arrives here as well: keep all of it in
+    // .runtime/qq.log and show only OpenQQ's bootstrap stages (QQ lines appear with /verbose).
+    for (const stream of [driver.stdout, driver.stderr]) {
+      stream.on('data', chunk => { if (!qqLog.writableEnded) qqLog.write(chunk); });
+      createInterface({ input: stream, crlfDelay: Infinity }).on('line', line => out.native(line));
+    }
+    driver.stdin.on('error', () => {});
+    driver.once('error', reject);
+    driver.once('exit', (code, signal) => {
+      if (code !== 0) reject(new Error(`原生引导器退出（${signal ?? code}）；请查看上方原生引导日志`));
+    });
+    out.log('info', `以正常参数启动 QQ ${qq.version}（独立原生挂接，无 Inspector 端口）`);
   }
-  driver.stdin.on('error', () => {});
-  driver.once('error', reject);
-  driver.once('exit', (code, signal) => {
-    if (code !== 0) reject(new Error(`原生引导器退出（${signal ?? code}）；请查看上方原生引导日志`));
-  });
-  out.log('info', `以正常参数启动 QQ ${qq.version}（独立原生挂接，无 Inspector 端口）`);
   const terminal = out.pretty && Boolean(process.stdin.isTTY);
   const input = startCommandInput({
     terminal, output: process.stdout, prompt: promptFor(out.paint, current),
@@ -225,11 +277,14 @@ async function start(qq, config, existingWebUI) {
   finally {
     clearTimeout(startupTimeout);
     input.close();
-    driver.stdin.end('stop\n');
-    // QQ keeps its log handles after bootstrap; release our ends so quitting can exit Node.
-    driver.stdout.destroy();
-    driver.stderr.destroy();
-    driver.unref();
+    // 附着模式下没有 driver（QQ 不是本进程拉起的），要跳过对它的收尾。
+    if (driver) {
+      driver.stdin.end('stop\n');
+      // QQ keeps its log handles after bootstrap; release our ends so quitting can exit Node.
+      driver.stdout.destroy();
+      driver.stderr.destroy();
+      driver.unref();
+    }
     botDispatch = async () => ({ status: 'failed', retcode: 1502, data: null, message: 'QQ 尚未就绪' });
     botLog = () => {};
     await channel.close();
