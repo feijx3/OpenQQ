@@ -5,6 +5,9 @@ const { parseCQ } = require('./cq.cjs');
 const admin = require('./admin.cjs');
 const { createElementBuilder } = require('./elements.cjs');
 
+// SSO 命令表：一个动作一行，加动作只加一行。
+const oidb = require('./oidb-actions.cjs');
+
 const MiB = 1024 * 1024;
 const sendActions = ['send_private_msg', 'send_group_msg', 'send_msg'];
 const exclusiveTypes = ['json', 'record', 'video', 'file'];
@@ -151,6 +154,25 @@ function validateAction(request) {
   }
   const managed = admin.validate(request, params);
   if (managed) return managed;
+  // ── OIDB 动作 ────────────────────────────────────────────────────────
+  // 放在 admin.validate 之后：已经有精确实现的动作（set_group_name / delete_group_file /
+  // 群信息 / 好友事件）先拿到机会，不会被这张表抢走路由。这里只补「JS 层根本没有对应
+  // 方法」的缺口（群设置、待办、管理员权限、闪传改名）。
+  // 危险动作（danger:true，不可撤回且影响他人）默认只构造不发送，必须显式传 confirm_danger。
+  if (oidb.OIDB_ACTIONS[request.action]) {
+    const act = oidb.OIDB_ACTIONS[request.action];
+    let body;
+    try { body = oidb.buildOidbBody(request.action, params); }
+    catch (e) { throw fail(`${request.action} 参数无效: ${e && e.message ? e.message : e}`, 1400); }
+    if (act.danger && params.confirm_danger !== true) {
+      return {
+        kind: 'oidb_dryrun', action: request.action, cmd: act.wire,
+        bodyHex: body.toString('hex'), bodyLen: body.length,
+        note: '危险动作（不可撤回且影响他人）：默认只构造不发送。确认要真发时传 confirm_danger: true',
+      };
+    }
+    return { kind: 'sso_pipe', action: request.action, cmd: act.wire, body };
+  }
   if (!sendActions.includes(request.action)) throw fail('尚未支持动作: ' + request.action, 1404);
   let type = request.action === 'send_private_msg' ? 'private' : request.action === 'send_group_msg' ? 'group' : params.message_type;
   if (!type) {
@@ -332,7 +354,14 @@ function createActionHandler(session, self, current, options = {}) {
     };
     try {
       return await Promise.race([cancelled, (async () => {
-        if (action.kind === 'sso_pipe') {
+        if (action.kind === 'oidb_dryrun') {
+      // 只回报将要发送的字节，不发 —— 调用方看 sent:false 就知道没有副作用。
+      return { status: 'failed', retcode: 1404, data: {
+        action: action.action, cmd: action.cmd, bodyHex: action.bodyHex,
+        bodyLen: action.bodyLen, sent: false, note: action.note,
+      } };
+    }
+    if (action.kind === 'sso_pipe') {
       // 判据：status 0 + 有 body = 服务端真回了；status 非 0 时 note 是服务端原文。
       if (action.action === 'sso_pipe_status') {
         // 探活 = 问一次补丁装没装。装上了才算通道就绪。
