@@ -5,6 +5,161 @@ const { parseCQ } = require('./cq.cjs');
 const admin = require('./admin.cjs');
 const { createElementBuilder } = require('./elements.cjs');
 
+// 原生方法直调表（一期只收只读动作）：动作名 → service 名 + 方法名 + 参数个数。
+// 加一个动作只加一行。写入类动作单独分期，避免一次 PR 里混着有副作用的路径。
+const NATIVE_OPS = {
+  get_profile_like: { service: 'ProfileLike', method: 'getBuddyProfileLike', arity: 1, build: p => [Number(p.user_id)] },
+  get_online_clients: { service: 'OnlineStatus', method: 'getOnlineFrdStatusInfos', arity: 0, build: () => [] },
+  get_recent_contact: { service: 'RecentContact', method: 'getRecentContactList', arity: 0, build: () => [] },
+  get_group_tags: { service: 'Group', method: 'getGroupTagRecords', arity: 1, build: p => [String(p.group_id ?? '')] },
+  list_filesets: { service: 'FlashTransfer', method: 'getFileSetList', arity: 1, build: p => [{ pageCount: Number(p.count ?? 20), pageIndex: Number(p.index ?? 0) }] },
+  get_clientkey: { service: 'Ticket', method: 'forceFetchClientKey', arity: 1, build: p => [String(p.cmd ?? '')] },
+  get_msg_emoji_likes: { service: 'msg', method: 'getMsgEmojiLikesList', arity: 7, build: p => {
+    const peer = (p.openqq_ref && typeof p.openqq_ref === 'object' && p.openqq_ref.peerUid)
+      ? { chatType: Number(p.openqq_ref.chatType ?? 2), peerUid: String(p.openqq_ref.peerUid), guildId: String(p.openqq_ref.guildId ?? '') }
+      : { chatType: p.group_id ? 2 : 1, peerUid: String(p.group_id ?? p.user_id ?? ''), guildId: '' };
+    return [peer, String(p.msg_id ?? p.message_id ?? ''), String(p.emoji_id ?? ''), Number(p.count ?? 20), String(p.cookie ?? ''), 0, false];
+  } },
+  fetch_emoji_like: { service: 'msg', method: 'getMsgEmojiLikesList', arity: 7, build: p => {
+    const peer = (p.openqq_ref && typeof p.openqq_ref === 'object' && p.openqq_ref.peerUid)
+      ? { chatType: Number(p.openqq_ref.chatType ?? 2), peerUid: String(p.openqq_ref.peerUid), guildId: String(p.openqq_ref.guildId ?? '') }
+      : { chatType: p.group_id ? 2 : 1, peerUid: String(p.group_id ?? p.user_id ?? ''), guildId: '' };
+    return [peer, String(p.msg_id ?? p.message_id ?? ''), String(p.emoji_id ?? ''), Number(p.count ?? 20), String(p.cookie ?? ''), 0, false];
+  } },
+  get_ai_record: { service: 'Group', method: 'listAllAIVoice', arity: 1, build: p => [{ groupCode: String(p.group_id ?? '') }] },
+  get_recent_emoji: { service: 'msg', method: 'getRecentUseEmojiList', arity: 0, build: () => [] },
+  fetch_group_essence_list: { service: 'Group', method: 'getGroupLatestEssenceList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  fetch_group_essence_list_legacy: { service: 'Group', method: 'getGroupLatestEssenceList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  query_cached_essence: { service: 'Group', method: 'queryCachedEssenceMsg', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  get_group_bulletin_list: { service: 'Group', method: 'getGroupBulletinList', arity: 4, cbIndex: 3, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? ''), pageStart: Number(p.page ?? 0), pageLimit: Number(p.count ?? 20) }, Number(p.page ?? 0), Number(p.count ?? 20), {}];
+  } },
+  get_group_bulletin_read_users: { service: 'Group', method: 'getGroupBulletinReadUsers', arity: 6, cbIndex: 5, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? ''), String(p.bulletin_id ?? p.feed_id ?? ''), Number(p.page ?? 0), Number(p.count ?? 20), '', null];
+  } },
+  get_group_tag_list: { service: 'Group', method: 'getGroupTagListByCategory', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? '') }];
+  } },
+  list_ai_voice: { service: 'Group', method: 'listAllAIVoice', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? '') }];
+  } },
+  get_group_member_level_info: { service: 'Group', method: 'getGroupMemberLevelInfo', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? '') }];
+  } },
+  get_group_shutup_list: { service: 'Group', method: 'queryGroupMuteMemberList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  get_group_shutup_list_legacy: { service: 'Group', method: 'queryGroupMuteMemberList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  get_transferable_group_list: { service: 'Group', method: 'getTransferableGroupList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  get_buddy_req: { service: 'Buddy', method: 'getBuddyReq', arity: 0, build: () => [] },
+  get_like_list: { service: 'OnlineStatus', method: 'getLikeList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [Number(p.count ?? 20)];
+  } },
+  get_group_file_list: { service: 'RichMedia', method: 'getGroupFileList', arity: 2, cbIndex: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? ''), pageStart: Number(p.page ?? 0), pageLimit: Number(p.count ?? 20) }, null];
+  } },
+  get_concern_weather: { service: 'NodeMisc', method: 'getConcernWeather', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{}];
+  } },
+  get_cities_weather: { service: 'NodeMisc', method: 'getCommonlyUsedCitiesWeather', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{}];
+  } },
+  get_bottom_emoji_table: { service: 'msg', method: 'getRecentUsedFaceList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{}];
+  } },
+  get_bottom_emoji_table_legacy: { service: 'msg', method: 'getRecentUsedFaceList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{}];
+  } },
+  get_keyword_emoji: { service: 'msg', method: 'fetchGetHitEmotionsByWord', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    // 实测：参数必须是对象且带 word 字段（传字符串会回 words:"" 并返回全量，传 {word:'哈哈'} 才按词命中）
+    return [{ word: String(p.word ?? p.keyword ?? p.text ?? '') }];
+  } },
+  get_keyword_emoji_legacy: { service: 'msg', method: 'fetchGetHitEmotionsByWord', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ word: String(p.word ?? p.keyword ?? p.text ?? '') }];
+  } },
+  fetch_group_notify: { service: 'Group', method: 'fetchGroupNotify', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? ''), reqType: Number(p.req_type ?? 0) }];
+  } },
+  get_group_notifies_unread: { service: 'Group', method: 'getGroupNotifiesUnreadCount', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  get_single_screen_notifies: { service: 'Group', method: 'getSingleScreenNotifies', arity: 3, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [Boolean(p.doubt ?? false), Number(p.count ?? 20), String(p.cookie ?? '')];
+  } },
+  get_single_screen_notifies_v2: { service: 'Group', method: 'getSingleScreenNotifiesV2', arity: 4, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [Boolean(p.doubt ?? false), Number(p.count ?? 20), String(p.cookie ?? ''), Number(p.filter ?? 0)];
+  } },
+  get_group_invite_limit: { service: 'Group', method: 'getGroupInviteNoAuthLimitNum', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  get_buddy_req_unread: { service: 'Buddy', method: 'getBuddyReqUnreadCnt', arity: 0, build: () => [] },
+  get_add_friend_blocked_list: { service: 'Buddy', method: 'getAddFriendBlockedList', arity: 2, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [Number(p.page ?? 0), Number(p.count ?? 20)];
+  } },
+  search_sys_faces: { service: 'Msg', method: 'fetchMarketEmoticonFaceImages', arity: 1, cbIndex: 0, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.keyword ?? p.word ?? '')];
+  } },
+  nc_get_user_status: { service: 'Profile', method: 'getStatus', arity: 2, cbIndex: 1, build: (p) => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    const id = String(p.uid ?? p.user_id ?? p.uin ?? '');
+    return [{ uids: [id] }, null];
+  } },
+  nc_get_packet_status: { service: 'MSF', method: 'getMsfStatus', arity: 0, build: () => [] },
+};
+
+function nativeRefusal(value, depth = 0) {
+  if (!value || typeof value !== 'object' || depth > 2) return null;
+  for (const key of NATIVE_FAIL_KEYS) {
+    const text = value[key];
+    if (typeof text === 'string' && text.trim() && NATIVE_FAIL_RE.test(text)) return text.trim().slice(0, 200);
+  }
+  // 只下钻这几个已知的包裹层（FlashTransfer 把结果放在 rsp 里），不扫整棵对象以免误伤。
+  for (const key of ['rsp', 'value', 'data', 'info']) {
+    const nested = nativeRefusal(value[key], depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+// SSO 命令表：一个动作一行，加动作只加一行。
+const oidb = require('./oidb-actions.cjs');
+
 const MiB = 1024 * 1024;
 const sendActions = ['send_private_msg', 'send_group_msg', 'send_msg'];
 const exclusiveTypes = ['json', 'record', 'video', 'file'];
@@ -116,6 +271,18 @@ function validateAction(request) {
   const params = request.params ?? {};
   if (!params || typeof params !== 'object' || Array.isArray(params)) throw fail('params 必须为对象');
   if (['get_login_info', 'get_status'].includes(request.action)) return { kind: request.action };
+  if (request.action === 'sso_pipe_status') return { kind: 'sso_pipe', action: 'sso_pipe_status' };
+  if (request.action === 'sso_pipe_send') {
+    const cmd = String(params.cmd ?? '').trim();
+    if (!cmd) throw fail('sso_pipe_send 需要 cmd', 1400);
+    if (cmd.length > 200) throw fail('sso_pipe_send 的 cmd 太长（>200）', 1400);
+    const hex = String(params.hex ?? params.body_hex ?? '').replace(/\s+/g, '');
+    if (hex && !/^[0-9a-fA-F]+$/.test(hex)) throw fail('sso_pipe_send 的 hex 不是合法十六进制', 1400);
+    if (hex.length % 2 !== 0) throw fail('sso_pipe_send 的 hex 长度必须是偶数', 1400);
+    if (hex.length / 2 > 16 * 1024 * 1024) throw fail('sso_pipe_send 的 body 超过 16MB', 1400);
+    return { kind: 'sso_pipe', action: 'sso_pipe_send', cmd, body: Buffer.from(hex, 'hex') };
+  }
+
   if (request.action === 'set_input_status') {
     if (!Number.isInteger(params.event_type) || params.event_type < 0 || params.event_type > 0x7fffffff) throw fail('event_type 必须是非负 int32');
     return { kind: 'input', target: identifier(params.user_id, 'user_id'), eventType: params.event_type };
@@ -139,6 +306,44 @@ function validateAction(request) {
   }
   const managed = admin.validate(request, params);
   if (managed) return managed;
+  // ── OIDB 动作 ────────────────────────────────────────────────────────
+  // 放在 admin.validate 之后：已经有精确实现的动作（set_group_name / delete_group_file /
+  // 群信息 / 好友事件）先拿到机会，不会被这张表抢走路由。这里只补「JS 层根本没有对应
+  // 方法」的缺口（群设置、待办、管理员权限、闪传改名）。
+  // 危险动作（danger:true，不可撤回且影响他人）默认只构造不发送，必须显式传 confirm_danger。
+  if (oidb.OIDB_ACTIONS[request.action]) {
+    const act = oidb.OIDB_ACTIONS[request.action];
+    let body;
+    try { body = oidb.buildOidbBody(request.action, params); }
+    catch (e) { throw fail(`${request.action} 参数无效: ${e && e.message ? e.message : e}`, 1400); }
+    if (act.danger && params.confirm_danger !== true) {
+      return {
+        kind: 'oidb_dryrun', action: request.action, cmd: act.wire,
+        bodyHex: body.toString('hex'), bodyLen: body.length,
+        note: '危险动作（不可撤回且影响他人）：默认只构造不发送。确认要真发时传 confirm_danger: true',
+      };
+    }
+    return { kind: 'sso_pipe', action: request.action, cmd: act.wire, body };
+  }
+  if (NATIVE_OPS[request.action]) {
+    const op = NATIVE_OPS[request.action];
+    let args;
+    try { args = op.build(params); }
+    catch (error) { throw fail(`${request.action} 参数无效: ${error && error.message ? error.message : error}`, 1400); }
+    if (!Array.isArray(args)) throw fail(`${request.action} 的参数构造没有返回数组`, 1400);
+    // arity 是实测的原生 argc。个数不对时 C++ 只在日志里断言、OneBot 侧只看到一个没头没尾的 1500，
+    // 所以这里提前拦下，把「实际几个 / 应该几个」直接说清楚。
+    if (Number.isSafeInteger(op.arity) && args.length !== op.arity) {
+      throw fail(`${request.action} 需要 ${op.arity} 个原生参数，实际构造了 ${args.length} 个`, 1400);
+    }
+    return { kind: 'native_op', action: request.action, canonical: request.action, service: op.service, method: op.method, args, cbIndex: op.cbIndex };
+  }
+  if (request.action === 'native_call') {
+    const method = String(params.method ?? '');
+    if (!/^[A-Za-z][A-Za-z0-9_]{1,60}$/.test(method)) throw fail('native_call 需要 method', 1400);
+    return { kind: 'native_op', action: 'native_call', service: String(params.service ?? 'msg'), method,
+      args: Array.isArray(params.args) ? params.args.slice(0, 12) : [] };
+  }
   if (!sendActions.includes(request.action)) throw fail('尚未支持动作: ' + request.action, 1404);
   let type = request.action === 'send_private_msg' ? 'private' : request.action === 'send_group_msg' ? 'group' : params.message_type;
   if (!type) {
@@ -155,6 +360,114 @@ function createActionHandler(session, self, current, options = {}) {
   const operations = new Set();
   const waiting = new Map();
   let disposed = false;
+
+  // ── 自研 SSO 发包（不依赖任何第三方注入组件）─────────────────────────
+  // bootstrap 在 QQ 进程内把一次 std::string 构造的跳转目标改到我们这（4 字节 + 12 字节跳板），
+  // 我们只负责告诉它"这一次 body 用我的字节"（arm），然后调 QQ 自己的
+  // Msg.sendSsoCmdReqByContend —— 包由 QQ 发、回包也由 QQ 收，不做任何内存扫描。
+  // 同一条命令在两个服务名前缀下可达性不同（有的会静默丢包），空回包时换另一个前缀再试一次。
+  const namesOf = value => {
+    if (!value || (typeof value !== 'object' && typeof value !== 'function')) return [];
+    const set = new Set();
+    for (let o = value; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+      for (const n of Object.getOwnPropertyNames(o)) if (n !== 'constructor') set.add(n);
+    }
+    return Array.from(set).sort();
+  };
+  const serviceOf = name => {
+    const key = String(name ?? '');
+    if (!/^[A-Za-z][A-Za-z0-9]{0,40}$/.test(key)) return null;
+    const camel = key.charAt(0).toUpperCase() + key.slice(1);
+    for (const getter of ['get' + camel + 'Service', 'get' + camel, key]) {
+      if (typeof session[getter] !== 'function') continue;
+      try { const svc = session[getter](); if (svc) return svc; } catch { /* 换下一个名字 */ }
+    }
+    return null;
+  };
+
+  async function selfSsoSend(cmd, bodyBuf) {
+    const armFn = globalThis.__openqqSsoBodyConv;
+    if (typeof armFn !== 'function') {
+      return { ok: false, status: -1, note: '__openqqSsoBodyConv 不存在：需要新 bootstrap' };
+    }
+    const st = armFn('status', '');
+    if (!st || !st.patched) {
+      return { ok: false, status: -1, note: 'body 代劳补丁未安装（bootstrap 启动时应自动装；失败说明 wrapper.node 版本不符）' };
+    }
+    const bytes = Buffer.isBuffer(bodyBuf) ? bodyBuf : Buffer.from(bodyBuf || []);
+
+    const once = async (name) => {
+      const arm = armFn('arm', bytes.toString('hex'));
+      if (!arm || !arm.ok) return { ok: false, status: -1, note: 'arm 失败：' + JSON.stringify(arm || null) };
+      const t0 = Date.now();
+      let res;
+      try {
+        const svc = session.getMsgService();
+        // 占位串只用来触发转换，内容随后由 native 覆盖成真 body。
+        res = await Promise.resolve(svc.sendSsoCmdReqByContend(name, 'A'.repeat(bytes.length || 1)));
+      } catch (error) {
+        return { ok: false, status: -1, ms: Date.now() - t0,
+          note: 'sendSsoCmdReqByContend 抛错：' + String((error && error.message) || error).slice(0, 180) };
+      }
+      const ms = Date.now() - t0;
+
+      let resp = Buffer.alloc(0);
+      if (res instanceof Uint8Array) resp = Buffer.from(res);
+      else if (typeof res === 'string') resp = Buffer.from(res, 'latin1');
+      else if (res && typeof res === 'object') {
+        const raw = res.rsp ?? res.body ?? res.data;
+        if (raw instanceof Uint8Array) resp = Buffer.from(raw);
+        else if (typeof raw === 'string') resp = Buffer.from(raw, 'latin1');
+      }
+
+      // 解 OidbBase：1=command 2=subCommand 3=errorCode 4=body 5=errorMsg
+      const ob = {};
+      {
+        let i = 0;
+        const rv = () => { let v = 0n, s = 0n, c; do { if (i >= resp.length) throw new Error('eof'); c = resp[i++]; v |= BigInt(c & 0x7f) << s; s += 7n; } while (c & 0x80); return v; };
+        while (i < resp.length) {
+          let t; try { t = Number(rv()); } catch { break; }
+          const field = t >>> 3, wire = t & 7;
+          if (wire === 0) { try { ob[field] = Number(rv()); } catch { break; } }
+          else if (wire === 2) { const n = Number(rv()); ob[field] = resp.subarray(i, i + n); i += n; }
+          else if (wire === 5) i += 4;
+          else if (wire === 1) i += 8;
+          else break;
+        }
+      }
+      // ⚠️ proto3 省略零值：errorCode==0 时 field3 根本不存在，不能拿 -1 当失败。
+      // 另外 trpc 回包（群相册那类）没有 OidbBase 外壳，field3 可能是 bytes 而不是 varint ——
+      // 这时它不是错误码，按 0 处理，否则会把成功显示成 errorCode=[object Object]。
+      const errorCode = typeof ob[3] === 'number' ? ob[3] : 0;
+      return {
+        ok: errorCode === 0 && resp.length > 0,
+        status: errorCode,
+        errorCode,
+        // field4 在正常回包里是 bytes，但也见过是 varint 的（这时 ob[4] 是 Number）。
+        // 统一成 Buffer，否则下游 .subarray/.length 会抛（get_pskey 就因此报过
+        // `body.subarray is not a function`）。
+        body: Buffer.isBuffer(ob[4]) ? ob[4] : Buffer.alloc(0),
+        errorMsg: ob[5] ? Buffer.from(ob[5]).toString('utf8') : '',
+        response: resp,
+        ms,
+        cmdUsed: name,
+        note: resp.length ? '' : '空回包',
+      };
+    };
+
+    const first = await once(cmd);
+    // 有回包（哪怕是业务错误码）就用它 —— 那是服务端的真实答复。
+    if (first.response && first.response.length) return first;
+    // arm 都失败（补丁没装等）就没必要重试第二个前缀。
+    if (!first.ms && first.status === -1) return first;
+    const alt = altSsoCmdName(cmd);
+    if (!alt) return first;
+    const second = await once(alt);
+    if (second.response && second.response.length) {
+      return { ...second, fallbackFrom: cmd, note: '' };
+    }
+    return { ...first, note: '两个前缀都没回包（' + cmd + ' / ' + alt + '）' };
+  }
 
   function observe(name, args) {
     const records = name === 'onMsgInfoListUpdate' ? args[0] : name === 'onAddSendMsg' ? [args[0]] : [];
@@ -222,7 +535,73 @@ function createActionHandler(session, self, current, options = {}) {
     };
     try {
       return await Promise.race([cancelled, (async () => {
-        if (action.kind === 'get_login_info') return { user_id: Number(self.uin), nickname: '' };
+        if (action.kind === 'native_op') {
+      const svc = serviceOf(action.service);
+      if (!svc) return { status: 'failed', retcode: 1404, data: { service: action.service }, message: '找不到 service ' + action.service };
+      const fn = svc[action.method];
+      if (typeof fn !== 'function') return { status: 'failed', retcode: 1404, data: { service: action.service, method: action.method }, message: 'service 上没有这个方法' };
+      // 回调桥：内核里有一批方法（精华列表 / 群公告列表 / 群文件列表…）不 return，结果只从最后一个
+      // 参数建成的回调里给出。IPC 传过来的 args 已经被 JSON 序列化过，函数在那种表示里活不下来，
+      // 所以回调位置在**执行侧**注入（cbIndex 指向第几个参数），并把回调实参当作返回值上报。
+      const callArgs = Array.isArray(action.args) ? action.args.slice() : [];
+      const cbIndex = Number.isSafeInteger(action.cbIndex) ? action.cbIndex : -1;
+      let cbValue; let cbCalled = false;
+      if (cbIndex >= 0 && cbIndex < callArgs.length) {
+        callArgs[cbIndex] = (...cbArgs) => { cbCalled = true; cbValue = cbArgs.length <= 1 ? cbArgs[0] : cbArgs; };
+      }
+      try {
+        // 有些方法既不 return 也不回调（参数形状不对时内核会把调用吞掉），
+        // 不设上限就会把这一次动作永久挂住，所以给一个有回调的等久一点、没回调的等短一点。
+        const waitMs = cbIndex >= 0 ? 12000 : 6000;
+        const value = await Promise.race([
+          Promise.resolve(fn.apply(svc, callArgs)),
+          new Promise((_, reject) => { const t = setTimeout(() => reject(new Error('原生调用超时：该方法既没有同步返回也没有触发回调')), waitMs); if (t.unref) t.unref(); }),
+        ]);
+        const effective = (value === undefined || value === null) && cbCalled ? cbValue : value;
+        let out = effective;
+        try { out = JSON.parse(JSON.stringify(effective === undefined ? null : effective)); } catch { out = String(effective); }
+        const nativeData = { action: action.action, service: action.service, method: action.method, argc: callArgs.length, via: cbCalled && (value === undefined || value === null) ? 'callback' : 'return', value: out };
+        const refusal = nativeRefusal(out);
+        if (refusal) return { status: 'failed', retcode: 1500, data: nativeData, message: 'QQ 拒绝' + action.action + '：' + refusal };
+        return { status: 'ok', retcode: 0, data: nativeData };
+      } catch (error) {
+        return { status: 'failed', retcode: 1500, data: { action: action.action, service: action.service, method: action.method, argc: callArgs.length, cbCalled },
+          message: String(error && error.message ? error.message : error).slice(0, 300) };
+      }
+    }
+    if (action.kind === 'oidb_dryrun') {
+      // 只回报将要发送的字节，不发 —— 调用方看 sent:false 就知道没有副作用。
+      return { status: 'failed', retcode: 1404, data: {
+        action: action.action, cmd: action.cmd, bodyHex: action.bodyHex,
+        bodyLen: action.bodyLen, sent: false, note: action.note,
+      } };
+    }
+    if (action.kind === 'sso_pipe') {
+      // 判据：status 0 + 有 body = 服务端真回了；status 非 0 时 note 是服务端原文。
+      if (action.action === 'sso_pipe_status') {
+        // 探活 = 问一次补丁装没装。装上了才算通道就绪。
+        const armFn = globalThis.__openqqSsoBodyConv;
+        const st = typeof armFn === 'function' ? (armFn('status', '') || {}) : { patched: false };
+        const ok = Boolean(st && st.patched);
+        return {
+          status: ok ? 'ok' : 'failed', retcode: ok ? 0 : 1500,
+          data: { channel: 'self', patched: Boolean(st && st.patched), ...st },
+          ...(ok ? {} : { message: 'body 代劳补丁未安装：需要配套的 openqq-bootstrap（wrapper.node 版本不符时会装不上）' }),
+        };
+      }
+      // 失败用 throw 表达：调用方那一层（session.cjs）只在 reject 时才写 retcode，
+      // 返回 {status:'failed'} 会被当成成功包进 data 里，调用方看不出错。
+      const r = await selfSsoSend(action.cmd, action.body);
+      if (r.status !== 0) throw fail(r.note || ('SSO 发送失败，status=' + r.status), 1500);
+      if (!r.body || !r.body.length) throw fail(r.note || '服务端没有回包（命令名或前缀可能不对）', 1500);
+      return {
+        cmd: action.cmd,
+        status: r.status,
+        responseLen: r.body.length,
+        responseHex: r.body.subarray(0, 65536).toString('hex'),
+      };
+    }
+    if (action.kind === 'get_login_info') return { user_id: Number(self.uin), nickname: '' };
         if (action.kind === 'get_status') return { online: true, good: true };
         if (action.kind === 'forward') {
           if (typeof options.expandForward !== 'function') throw fail('当前会话不支持获取合并转发', 1500);
