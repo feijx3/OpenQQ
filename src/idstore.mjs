@@ -39,7 +39,10 @@ export function createIdStore(path, { limit = 10000, delayMs = 2000 } = {}) {
       writeFileSync(temp, JSON.stringify({ version: 1, nextId, entries: entries.slice(-limit) }), { mode: 0o600, flag: 'wx' });
       renameSync(temp, path);
     } catch { /* best effort */ }
-    finally { rmSync(temp, { force: true }); }
+    // 清理临时文件也是 best-effort：父目录不是目录时 rmSync 会抛 ENOTDIR，
+    // 而它在 finally 里 —— 不吞掉就会盖掉上面真正的失败原因，把「写失败被忽略」
+    // 变成「flush 抛异常」，把一个刻意容错的路径变成会把异常抛进消息投递的路径。
+    finally { try { rmSync(temp, { force: true }); } catch { /* best effort */ } }
   }
 
   return {
