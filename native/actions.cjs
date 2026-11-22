@@ -5,7 +5,26 @@ const { parseCQ } = require('./cq.cjs');
 const admin = require('./admin.cjs');
 const { createElementBuilder } = require('./elements.cjs');
 
-// 原生方法直调表（一期只收只读动作）：动作名 → service 名 + 方法名 + 参数个数。
+// 内核原生方法里的「会话」一律是 {chatType, peerUid, guildId} 这个三元结构，
+// 而 OneBot 那边是 group_id / user_id 两个数字。所有互动类动作都要做这一次翻译，
+// 所以收敛到一个函数，避免每个动作各写一遍（写歪一处就是 -100 这种找不到原因的回绝）。
+function nativePeerOf(params) {
+  const ref = params && params.openqq_ref;
+  if (ref && typeof ref === 'object' && typeof ref.peerUid === 'string' && ref.peerUid) {
+    return { chatType: Number(ref.chatType ?? 2) === 1 ? 1 : 2, peerUid: String(ref.peerUid).slice(0, 64), guildId: String(ref.guildId ?? '') };
+  }
+  const group = params ? params.group_id : undefined;
+  const user = params ? params.user_id : undefined;
+  if (group !== undefined && group !== null && String(group) !== '') {
+    return { chatType: 2, peerUid: String(group), guildId: '' };
+  }
+  if (user !== undefined && user !== null && String(user) !== '') {
+    return { chatType: 1, peerUid: String(user), guildId: '' };
+  }
+  throw new Error('需要 group_id 或 user_id（或 openqq_ref.peerUid）');
+}
+
+// 原生方法直调表：动作名 → service 名 + 方法名 + 参数个数。
 // 加一个动作只加一行。写入类动作单独分期，避免一次 PR 里混着有副作用的路径。
 const NATIVE_OPS = {
   get_profile_like: { service: 'ProfileLike', method: 'getBuddyProfileLike', arity: 1, build: p => [Number(p.user_id)] },
