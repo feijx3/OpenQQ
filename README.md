@@ -22,6 +22,7 @@ Windows x64 与 Linux（x64 / arm64）QQ NT 的 OneBot v11 桥接，同时支持
 - 图形化 Bot：在 WebUI 里像 Scratch 一样拖积木编制自己的 Bot（触发、条件、变量、发送消息、调用 AI、读写记忆），接入 OpenAI 兼容接口，每个 Bot 有独立的人设和记忆。「AI 接入」页顶部有一条可修改、可关闭的推广位（默认介绍 [zelix.asia](https://zelix.asia)），只显示在界面里，不会发到 QQ。详见 [docs/bot.md](docs/bot.md)。
 - Docker：内置 [Dockerfile](Dockerfile) 与 [compose.yaml](compose.yaml)，通过 `Xvfb` + 可选 `noVNC` 支持无头扫码与滑块登录。
 - 终端：交互模式支持命令补全、历史记录和 `/verbose`、`/clear`、`/quit`；接管道或加 `--json` 时输出 OneBot 的 JSON Lines。
+- 热附着与热重载：QQ 已经在运行、且里面还留着上次注入的原生脚本时，重启 OpenQQ 会直接附着上去，不重启 QQ、不需要重新登录；改完 `native/actions.cjs` 后下一次动作调用即生效，不用重启任何进程。见 [docs/hot-attach.md](docs/hot-attach.md)。
 
 ## 界面预览
 
@@ -118,6 +119,7 @@ npm start -- --qq-root "C:\Program Files\Tencent\QQNT"    # 临时指定 QQ 目�
 
 - WebUI 默认只绑定 `127.0.0.1`。访问密钥用 `timingSafeEqual` 比较；页面加载后立刻用 `history.replaceState` 清掉 URL 片段里的密钥，之后只放在当前标签页的 `sessionStorage`。
 - 路径和会话脚本通过标准输入交给原生启动器（`openqq-launch.exe` / `openqq-launch`），包括管道/Unix Socket 路径和一次性令牌，所以它们不会出现在进程命令行里；Linux 端通过仅父子可见的匿名管道将配置传入 `openqq-bootstrap.so` 后立即关闭描述符并清理环境变量，不进入环境变量或子进程。
+- IPC 端点名是随机的（每次生成 128 位随机串），生成后连同令牌一起写入 `.runtime/ipc.json`（`0600`），下次启动复用同一个端点 —— 这样「重启 OpenQQ 不重启 QQ」才成立，同时本机其他进程无法从项目路径推导出端点名去抢占它。**Windows 上 `0600` 不生效**：文件权限沿用的是 `%USERPROFILE%` 的 ACL，命名管道则由系统按创建者的安全描述符限制，只有当前用户、`SYSTEM` 和 `Administrators` 能连。也就是说，同一台机器上的管理员账户或已经以你的身份运行的进程仍然能读到该文件；这条防线针对的是「其他普通用户」和「猜端点名的程序」，不是「已经拿到你账户的恶意软件」。
 - 配置文件拒绝 UNC 路径和控制字符。启动器只从项目目录加载，并通过文件句柄或 `realpath` 确认 QQ、wrapper 和原生模块的真实路径；IPC Unix Socket 置于 `0700` 权限临时目录内且仅对当前用户可读写（`0600`）。
 - OneBot 正向 WebSocket 服务端和 HTTP 服务都会限制单个 IP 的连续鉴权失败：60 秒内超过 20 次返回 429。WebUI 的访问密钥是每次启动随机生成的 256 位值，没有单独的失败限流，只限制同时执行的动作数。以 `//` 开头的请求地址会被两个服务拒绝，反向连接不跟随重定向。
 
@@ -143,6 +145,7 @@ npm run test:native
 - [图形化 Bot 与 AI 养鱼：积木、AI 接入、人设与记忆、推广位](docs/bot.md)
 - [事件格式、扩展字段与已知限制](docs/events.md)
 - [原生挂接原理与客户端兼容性检查](docs/local-client.md)
+- [热附着与热重载：重启 OpenQQ 不重启 QQ、改动作不重启进程](docs/hot-attach.md)
 
 ## 参与贡献
 

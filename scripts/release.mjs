@@ -174,6 +174,24 @@ async function main() {
   const sessionOut = sessionBundle.outputFiles[0].text;
   writeOut('native/session.cjs', sessionOut);
 
+  // 2b. The action handler ships as its own file so session.cjs can require it at
+  // runtime and swap it when the mtime changes (hot reload). Bundling it into
+  // session.cjs would make that reload impossible.
+  const actionsBundle = await build({
+    absWorkingDir: root,
+    entryPoints: ['native/actions.cjs'],
+    bundle: true,
+    write: false,
+    format: 'cjs',
+    platform: 'node',
+    target: ['node20'],
+    minify: true,
+    legalComments: 'none',
+    external: ['node:*'],
+  });
+  const actionsOut = actionsBundle.outputFiles[0].text;
+  writeOut('native/actions.cjs', actionsOut);
+
   // 3. WebUI assets.
   await buildUI({ outdir: join(releaseDir, 'web'), logLevel: 'warning' });
   copyOut('web/index.html', 'web/index.html');
@@ -190,6 +208,7 @@ async function main() {
   console.log(`  Archive: ${archivePath} (${kb(statSync(archivePath).size)})`);
   console.log(`  src/main.mjs:       ${kb(Buffer.byteLength(mainOut))}`);
   console.log(`  native/session.cjs: ${kb(Buffer.byteLength(sessionOut))}`);
+  console.log(`  native/actions.cjs: ${kb(Buffer.byteLength(actionsOut))}`);
   console.log(`  web/app.js:         ${kb(statSync(join(releaseDir, 'web/app.js')).size)}`);
 }
 

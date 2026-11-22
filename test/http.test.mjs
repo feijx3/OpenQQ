@@ -208,6 +208,9 @@ test('HTTP POST reporting sends messages, notices and requests with the headers 
     assert.equal(post.headers['x-self-id'], '12345');
     assert.equal(post.headers['x-signature'], 'sha1=' + createHmac('sha1', 'shared-secret').update(post.raw).digest('hex'));
   }
+  // 三个 POST 到达接收端时，发送端那侧的 fetch 可能还没 resolve，state 仍会读到 waiting。
+  // 等它落定再断言，否则这个用例会随着机器负载时通时不通。
+  await until(() => f.state().httpPost[0]?.state === 'ok', 'receiver state ok');
   assert.deepEqual(f.state().httpPost, [{ index: 0, state: 'ok' }]);
   assert.equal(off.posts.length, 0, 'disabled receivers get nothing');
 });
