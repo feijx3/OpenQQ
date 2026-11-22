@@ -389,7 +389,7 @@ const OIDB_ACTIONS = {
     body: {
       1: { name: 'groupUin', kind: 'varint' },
       2: { name: 'settings', kind: 'message', fields: {
-        1: { name: 'appPrivilegeFlag', kind: 'varint' },
+        1: { name: 'appPrivilegeFlag', kind: 'varint', keepZero: true },
         2: { name: 'appPrivilegeMask', kind: 'varint' },
       } },
       3: { name: 'field12', kind: 'varint' },
@@ -430,7 +430,7 @@ const OIDB_ACTIONS = {
     body: {
       1: { name: 'groupUin', kind: 'varint' },
       2: { name: 'settings', kind: 'message', fields: {
-        1: { name: 'addType', kind: 'varint' },
+        1: { name: 'addType', kind: 'varint', keepZero: true },
         2: { name: 'groupQuestion', kind: 'string' },
         3: { name: 'groupAnswer', kind: 'string' },
       } },
@@ -453,7 +453,7 @@ const OIDB_ACTIONS = {
     command: 4691, subCommand: 1, wire: 'OidbSvcTrpcTcp.0x1253_1',
     body: {
       1: { name: 'groupUin', kind: 'varint' },
-      2: { name: 'type', kind: 'varint' },
+      2: { name: 'type', kind: 'varint', keepZero: true },   // 0 = 解除禁言，是有效值不是默认值
       3: { name: 'body', kind: 'message', fields: {
         1: { name: 'targetUid', kind: 'string' },
         2: { name: 'duration', kind: 'varint' },
@@ -915,7 +915,9 @@ const OIDB_ACTIONS = {
       return {
         groupCode: p.group_id,
         operation: {
-          adminUins: [Number(uid)],   // encodeBySchema 只编第一个值，单成员够用
+          // repeated 字段，但 encodeBySchema 一次只编一个值 —— 传数组会让 pb.varint 抛 TypeError。
+          // 这个动作本来就是单成员操作（给一个人开/关管理员接收验证），传单值即可。
+          adminUins: Number(uid),
           authority: 1,
           operate: p.enable === undefined ? 1 : (Boolean(p.enable) ? 1 : 0),
         },
