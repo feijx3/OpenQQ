@@ -178,7 +178,7 @@ const NATIVE_OPS = {
   send_to_new_members: { service: 'Group', method: 'publishInstructionForNewcomers', arity: 3, build: p => [String(p.group_id ?? ''), String(p.content ?? p.message ?? p.text ?? ''), Array.isArray(p.at) ? p.at : []] },
   mark_msg_as_read: { service: 'msg', method: 'setMsgRead', arity: 1, build: p => [{ chatType: Number(p.group_id ? 2 : 1), peerUid: String(p.group_id ?? p.user_id ?? ''), guildId: '' }] },
   mark_group_msg_as_read: { service: 'msg', method: 'setMsgRead', arity: 1, build: p => [{ chatType: 2, peerUid: String(p.group_id ?? ''), guildId: '' }] },
-  mark_private_msg_as_read: { service: 'msg', method: 'setMsgRead', arity: 1, build: p => [{ chatType: 1, peerUid: String(p.user_id ?? ''), guildId: '' }] },
+  mark_private_msg_as_read: { service: 'msg', method: 'setMsgRead', arity: 1, needsUid: [[0, 'peerUid']], build: p => [{ chatType: 1, peerUid: String(p.user_id ?? ''), guildId: '' }] },
   set_msg_emoji_like: { service: 'msg', method: 'setMsgEmojiLikes', arity: 5, build: p => {
     if (Array.isArray(p.raw_args)) return p.raw_args;
     // `message_id` 是 OneBot 自增序号，不是 QQ 真 msgId（见 src/onebot.mjs 的 nextId++）。
@@ -246,7 +246,7 @@ const NATIVE_OPS = {
     if (Array.isArray(p.raw_args)) return p.raw_args;
     return [{ groupCode: String(p.group_id ?? ''), voiceId: String(p.voice_id ?? ''), voiceName: String(p.voice_name ?? '') }];
   } },
-  approval_friend_request: { service: 'Buddy', method: 'approvalFriendRequest', arity: 1, build: p => {
+  approval_friend_request: { service: 'Buddy', method: 'approvalFriendRequest', arity: 1, needsUid: [[0, 'friendUid']], build: p => {
     if (Array.isArray(p.raw_args)) return p.raw_args;
     return [{ friendUid: String(p.uid ?? p.user_id ?? p.uin ?? ''), reqTime: String(p.flag ?? p.req_time ?? ''), accept: Boolean(p.approve ?? true) }];
   } },
@@ -254,11 +254,11 @@ const NATIVE_OPS = {
     if (Array.isArray(p.raw_args)) return p.raw_args;
     return [String(p.uin ?? p.user_id ?? ''), Boolean(p.approve ?? true), null];
   } },
-  del_buddy: { service: 'Buddy', method: 'delBuddy', arity: 1, build: p => {
+  del_buddy: { service: 'Buddy', method: 'delBuddy', arity: 1, needsUid: [[0, 'friendUid']], build: p => {
     if (Array.isArray(p.raw_args)) return p.raw_args;
     return [{ friendUid: String(p.user_id ?? p.uin ?? '') }];
   } },
-  set_buddy_remark: { service: 'Buddy', method: 'setBuddyRemark', arity: 1, build: p => {
+  set_buddy_remark: { service: 'Buddy', method: 'setBuddyRemark', arity: 1, needsUid: [[0, 'uid']], build: p => {
     if (Array.isArray(p.raw_args)) return p.raw_args;
     return [{ uid: String(p.user_id ?? p.uin ?? ''), remark: String(p.remark ?? '') }];
   } },
@@ -302,15 +302,15 @@ const NATIVE_OPS = {
     if (Array.isArray(p.raw_args)) return p.raw_args;
     return [String(p.group_id ?? ''), Array.isArray(p.user_ids) ? p.user_ids.map(String) : [String(p.user_id ?? '')]];
   } },
-  del_buddy_req: { service: 'Buddy', method: 'delBuddyReq', arity: 1, build: p => {
+  del_buddy_req: { service: 'Buddy', method: 'delBuddyReq', arity: 1, needsUid: [[0, 'friendUid']], build: p => {
     if (Array.isArray(p.raw_args)) return p.raw_args;
     return [{ friendUid: String(p.uid ?? p.user_id ?? ''), reqTime: String(p.flag ?? '') }];
   } },
-  set_block: { service: 'Buddy', method: 'setBlock', arity: 2, build: p => {
+  set_block: { service: 'Buddy', method: 'setBlock', arity: 2, needsUid: [0], build: p => {
     if (Array.isArray(p.raw_args)) return p.raw_args;
     return [String(p.uid ?? p.user_id ?? ''), Boolean(p.block ?? true)];
   } },
-  is_blocked: { service: 'Buddy', method: 'isBlocked', arity: 1, build: p => {
+  is_blocked: { service: 'Buddy', method: 'isBlocked', arity: 1, needsUid: [0], build: p => {
     if (Array.isArray(p.raw_args)) return p.raw_args;
     return [String(p.uid ?? p.user_id ?? '')];
   } },
@@ -564,7 +564,7 @@ function validateAction(request) {
       return { kind: 'native_dryrun', action: request.action, service: op.service, method: op.method, args,
         note: '不可撤回的动作：默认只构造不发送。确认要真发时传 confirm_danger: true' };
     }
-    return { kind: 'native_op', action: request.action, canonical: request.action, service: op.service, method: op.method, args, cbIndex: op.cbIndex };
+    return { kind: 'native_op', action: request.action, canonical: request.action, service: op.service, method: op.method, args, cbIndex: op.cbIndex, needsUid: op.needsUid };
   }
   if (request.action === 'native_call') {
     const method = String(params.method ?? '');
@@ -788,6 +788,37 @@ function createActionHandler(session, self, current, options = {}) {
       // 参数建成的回调里给出。IPC 传过来的 args 已经被 JSON 序列化过，函数在那种表示里活不下来，
       // 所以回调位置在**执行侧**注入（cbIndex 指向第几个参数），并把回调实参当作返回值上报。
       const callArgs = Array.isArray(action.args) ? action.args.slice() : [];
+      // 有一批内核方法要的是 NT UID（`u_...`），而 OneBot 那边给的是数字 QQ 号。
+      // build 是同步函数、没法在里面 await 换 uid，所以统一挪到执行前做一次。
+      // needsUid 描述「哪个参数的哪个字段」：[[0,'friendUid']] 表示 callArgs[0].friendUid，[0] 表示 callArgs[0] 本身。
+      if (Array.isArray(action.needsUid)) {
+        for (const spec of action.needsUid) {
+          const slot = Array.isArray(spec) ? spec[0] : spec;
+          const field = Array.isArray(spec) ? spec[1] : null;
+          const holder = callArgs[slot];
+          if (holder === undefined || holder === null) continue;
+          const current = field ? holder[field] : holder;
+          const asText = String(current ?? '');
+          if (!asText || asText.startsWith('u_')) continue;      // 已经是 uid 就原样用
+          if (!/^\d{5,12}$/.test(asText)) continue;              // 不是数字号，交给内核自己判断
+          let uid = '';
+          try {
+            const profile = serviceOf('Profile');
+            if (profile && typeof profile.getUserDetailInfoByUin === 'function') {
+              const det = await profile.getUserDetailInfoByUin(asText);
+              uid = String((det && det.detail && (det.detail.uid || (det.detail.simpleInfo && det.detail.simpleInfo.uid))) || '');
+            }
+          } catch (error) {
+            return { status: 'failed', retcode: 1500, data: { action: action.action, uin: asText },
+              message: '把 QQ 号换成 NT UID 时抛错：' + String(error && error.message ? error.message : error).slice(0, 140) };
+          }
+          if (!uid) {
+            return { status: 'failed', retcode: 1400, data: { action: action.action, uin: asText },
+              message: `拿不到 ${asText} 的 NT UID（getUserDetailInfoByUin 返回空）—— 这个动作要的是 u_... 形式，不是数字号` };
+          }
+          if (field) holder[field] = uid; else callArgs[slot] = uid;
+        }
+      }
       const cbIndex = Number.isSafeInteger(action.cbIndex) ? action.cbIndex : -1;
       let cbValue; let cbCalled = false;
       if (cbIndex >= 0 && cbIndex < callArgs.length) {
