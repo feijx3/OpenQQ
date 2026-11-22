@@ -322,13 +322,23 @@ const NATIVE_OPS = {
     if (Array.isArray(p.raw_args)) return p.raw_args;
     return [{ emojiId: String(p.emoji_id ?? p.emoji ?? p.file_id ?? ''), isOrigin: 1 }];
   } },
+  // ⚠️ 内核里只有 Avatar.forceDownloadGroupPortrait —— 那是「下载/刷新群头像」，**不是设置**。
+  // 以前把它当成 set 用，调了回 result:0，看起来成功，实际群头像没变。
+  // 设置群头像要先把图片传上去再走 OIDB（我们还没接），所以这里如实说明，不要假装成功。
   set_group_portrait: { service: 'Avatar', method: 'forceDownloadGroupPortrait', arity: 3, cbIndex: 2, build: (p) => {
     if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? ''), { width: Number(p.width ?? 100), height: Number(p.height ?? 100) }, null];
+    throw new Error('QQ 内核只有「下载/刷新群头像」(forceDownloadGroupPortrait)，没有设置群头像的方法。'
+      + '设置群头像需要先上传图片再走 OIDB，这条通道还没实现；这个动作现在不会改动群头像，请不要以为它生效了');
   } },
+  // addCollection 只收一个对象。以前恒传 [{}]，等于把所有入参都丢掉，调用方给什么都一样。
   create_collection: { service: 'Collection', method: 'addCollection', arity: 1, build: (p) => {
     if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{}];
+    const payload = {};
+    for (const [key, value] of Object.entries(p || {})) {
+      if (key === 'raw_args') continue;
+      payload[key] = value;
+    }
+    return [payload];
   } },
 };
 
