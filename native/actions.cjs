@@ -18,6 +18,11 @@ const PRIVATE_V4 = [
 ];
 const PRIVATE_V6 = [/^::$/, /^::1$/, /^f[cd]/, /^fe[89ab]/, /^::ffff:/];
 
+// 字面检查只能挡住「url 里直接写着内网 IP」的情况。挡不住的是「域名解析到内网」——
+// `127.0.0.1.nip.io` 这种公共泛解析域名、或者任何人自己域名下的一条 A 记录，都能绕过它。
+// 所以分两层：
+//   · 这一层是同步的字面检查，validateAction 阶段就能拒掉最明显的一批（连 DNS 都不用问）；
+//   · 真正的 DNS 判定在 assertHostResolves()，由执行侧在发请求前 await（那里才允许异步）。
 function assertPublicHttpUrl(raw) {
   let url;
   try { url = new URL(String(raw)); } catch { throw fail('download_file 的 url 不是合法地址'); }
@@ -25,7 +30,7 @@ function assertPublicHttpUrl(raw) {
   if (url.username || url.password) throw fail('download_file 不接受带账号密码的 url');
   const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (!host) throw fail('download_file 的 url 没有主机名');
-  if (host === 'localhost' || /\.(localhost|local|internal|lan|home\.arpa)$/.test(host)) {
+  if (/^(localhost|.*\.(localhost|localdomain|local|internal|lan|home\.arpa))$/.test(host)) {
     throw fail(`download_file 拒绝本机或内网主机名：${host}`);
   }
   if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
@@ -38,6 +43,39 @@ function assertPublicHttpUrl(raw) {
     }
   }
   return url;
+}
+
+// 域名解析到内网也算内网。解析不出来就拒绝 —— 「解析失败但请求能通」本身就很可疑。
+// TOCTOU 无法彻底消除（解析到这里、真发请求时可能已经换了答案），但这条挡掉了 review 指出的
+// 「用公共泛解析域名绕过字面检查」那一类。
+async function assertHostResolves(raw) {
+  let url;
+  try { url = new URL(String(raw)); } catch { return; }
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host || /^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(':')) return;   // 字面地址上面已经判过
+  let records;
+  try {
+    records = await require('node:dns').promises.lookup(host, { all: true, verbatim: true });
+  } catch (error) {
+    throw fail(`download_file 无法解析主机名 ${host}：${String(error && error.message ? error.message : error).slice(0, 120)}`);
+  }
+  if (!Array.isArray(records) || records.length === 0) throw fail(`download_file 解析不到任何地址：${host}`);
+  const net = require('node:net');
+  for (const record of records) {
+    const address = String(record && record.address ? record.address : '');
+    if (!address) continue;
+    const kind = net.isIP(address);
+    if (kind === 4) {
+      for (const [pattern, range] of PRIVATE_V4) {
+        if (pattern.test(address)) throw fail(`download_file 拒绝内网地址（${range}）：${host} 解析到 ${address}`);
+      }
+    } else if (kind === 6) {
+      const lowered = address.toLowerCase();
+      for (const pattern of PRIVATE_V6) {
+        if (pattern.test(lowered)) throw fail(`download_file 拒绝内网 IPv6 地址：${host} 解析到 ${address}`);
+      }
+    }
+  }
 }
 
 // 文件名只留安全字符：basename 挡不住 '..'，而 '..' 会让落盘路径跳出 data/downloads。
@@ -914,6 +952,12 @@ function createActionHandler(session, self, current, options = {}) {
             message: `base64 内容超过 ${action.maxBytes} 字节上限` };
         }
       } else {
+        // 字面检查在 validateAction 阶段做过了；这里补上「域名解析到内网」那一层 ——
+        // 它必须先于真正发请求，否则 nip.io 这类公共泛解析域名能一路走到 fetch。
+        try { await assertHostResolves(action.url); } catch (error) {
+          return { status: 'failed', retcode: 1400, data: { action: 'download_file', url: action.url },
+            message: String(error && error.message ? error.message : error).slice(0, 200) };
+        }
         const ac = new AbortController();
         const timer = setTimeout(() => ac.abort(), 60000);
         if (timer.unref) timer.unref();
@@ -1126,4 +1170,4 @@ function createActionHandler(session, self, current, options = {}) {
   return { execute, observe, dispose };
 }
 
-module.exports = { validateAction, createActionHandler, normalizeParams };
+module.exports = { validateAction, createActionHandler, normalizeParams, assertPublicHttpUrl, assertHostResolves };
