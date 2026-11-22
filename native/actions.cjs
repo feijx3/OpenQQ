@@ -391,6 +391,15 @@ function createActionHandler(session, self, current, options = {}) {
     return null;
   };
 
+  function altSsoCmdName(cmd) {
+    const s = String(cmd || '');
+    let m = /^OidbSvcTrpcTcp\.(0x[0-9a-f]+_\d+)$/i.exec(s);
+    if (m) return 'OidbSvc.' + m[1];
+    m = /^OidbSvc\.(0x[0-9a-f]+_\d+)$/i.exec(s);
+    if (m) return 'OidbSvcTrpcTcp.' + m[1];
+    return null;
+  }
+
   async function selfSsoSend(cmd, bodyBuf) {
     const armFn = globalThis.__openqqSsoBodyConv;
     if (typeof armFn !== 'function') {
