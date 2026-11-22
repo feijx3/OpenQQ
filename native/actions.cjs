@@ -82,6 +82,25 @@ async function readBodyCapped(response, maxBytes) {
 
 // 原生方法直调表（一期只收只读动作）：动作名 → service 名 + 方法名 + 参数个数。
 // 加一个动作只加一行。写入类动作单独分期，避免一次 PR 里混着有副作用的路径。
+// 内核原生方法里的「会话」一律是 {chatType, peerUid, guildId} 这个三元结构，
+// 而 OneBot 那边是 group_id / user_id 两个数字。所有互动类动作都要做这一次翻译，
+// 所以收敛到一个函数，避免每个动作各写一遍（写歪一处就是 -100 这种找不到原因的回绝）。
+function nativePeerOf(params) {
+  const ref = params && params.openqq_ref;
+  if (ref && typeof ref === 'object' && typeof ref.peerUid === 'string' && ref.peerUid) {
+    return { chatType: Number(ref.chatType ?? 2) === 1 ? 1 : 2, peerUid: String(ref.peerUid).slice(0, 64), guildId: String(ref.guildId ?? '') };
+  }
+  const group = params ? params.group_id : undefined;
+  const user = params ? params.user_id : undefined;
+  if (group !== undefined && group !== null && String(group) !== '') {
+    return { chatType: 2, peerUid: String(group), guildId: '' };
+  }
+  if (user !== undefined && user !== null && String(user) !== '') {
+    return { chatType: 1, peerUid: String(user), guildId: '' };
+  }
+  throw new Error('需要 group_id 或 user_id（或 openqq_ref.peerUid）');
+}
+
 const NATIVE_OPS = {
   get_profile_like: { service: 'ProfileLike', method: 'getBuddyProfileLike', arity: 1, build: p => [Number(p.user_id)] },
   get_online_clients: { service: 'OnlineStatus', method: 'getOnlineFrdStatusInfos', arity: 0, build: () => [] },
@@ -406,6 +425,12 @@ const IRREVERSIBLE = new Set([
   'approval_doubt_buddy',
 ]);
 
+// QQ 的原生方法不会抛错，失败原因写在返回值的某个文案字段里（FlashTransfer 放在 `errMs`，少一个 g）。
+// 只认文案不认数字码 —— `errCode 5` 是「这个群没有精华」这种状态，不是失败。
+const NATIVE_FAIL_RE = /(失败|错误|繁忙|超时|无权限|拒绝|不存在|没有权限|格式错误|not exist|failed|failure|error|\berr\b|invalid|denied|timeout|busy|param error)/i;
+// `clientWording` / `retMsg` 是 QQ 业务结果结构里的真实原因字段（见下面的 *Result 下钻）。
+const NATIVE_FAIL_KEYS = ['errMsg', 'errMs', 'msg', 'message', 'wording', 'clientWording', 'retMsg', 'errorMsg'];
+
 function nativeRefusal(value, depth = 0) {
   if (!value || typeof value !== 'object' || depth > 2) return null;
   for (const key of NATIVE_FAIL_KEYS) {
@@ -673,6 +698,15 @@ function createActionHandler(session, self, current, options = {}) {
     }
     return null;
   };
+
+  function altSsoCmdName(cmd) {
+    const s = String(cmd || '');
+    let m = /^OidbSvcTrpcTcp\.(0x[0-9a-f]+_\d+)$/i.exec(s);
+    if (m) return 'OidbSvc.' + m[1];
+    m = /^OidbSvc\.(0x[0-9a-f]+_\d+)$/i.exec(s);
+    if (m) return 'OidbSvcTrpcTcp.' + m[1];
+    return null;
+  }
 
   async function selfSsoSend(cmd, bodyBuf) {
     const armFn = globalThis.__openqqSsoBodyConv;
