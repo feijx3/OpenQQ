@@ -143,6 +143,12 @@ const NATIVE_OPS = {
   nc_get_packet_status: { service: 'MSF', method: 'getMsfStatus', arity: 0, build: () => [] },
 };
 
+// QQ 的原生方法不会抛错，失败原因写在返回值的某个文案字段里（FlashTransfer 放在 `errMs`，少一个 g）。
+// 只认文案不认数字码 —— `errCode 5` 是「这个群没有精华」这种状态，不是失败。
+const NATIVE_FAIL_RE = /(失败|错误|繁忙|超时|无权限|拒绝|不存在|没有权限|格式错误|not exist|failed|failure|error|\berr\b|invalid|denied|timeout|busy|param error)/i;
+// `clientWording` / `retMsg` 是 QQ 业务结果结构里的真实原因字段（见下面的 *Result 下钻）。
+const NATIVE_FAIL_KEYS = ['errMsg', 'errMs', 'msg', 'message', 'wording', 'clientWording', 'retMsg', 'errorMsg'];
+
 function nativeRefusal(value, depth = 0) {
   if (!value || typeof value !== 'object' || depth > 2) return null;
   for (const key of NATIVE_FAIL_KEYS) {
