@@ -940,19 +940,26 @@ function createActionHandler(session, self, current, options = {}) {
     if (action.kind === 'forward_send') {
       // 源消息：来自主进程附加的 openqq_ref，里面有真 msgId + 源会话的 peerUid（nativeRef 已校验格式）
       const src = action.source;
-      // 目标会话：把 targetUin（QQ 号/群号）换成 peerUid。getUserDetailInfoByUin 是 argc==1 + 异步，必须 await。
+      // 目标会话：
+      //  · 群聊的 peerUid **就是群号本身**（QQ NT 不按 uid 索引群）。以前对群号也调
+      //    getUserDetailInfoByUin —— 不但必然失败，撞上同号用户时还会把消息转发给一个陌生人。
+      //  · 私聊才需要把 QQ 号换成 u_... 形式的 uid（getUserDetailInfoByUin argc==1 + 异步，必须 await）。
       let targetUid = '';
-      try {
-        const profileSvc = session.getProfileService();
-        const det = await profileSvc.getUserDetailInfoByUin(action.targetUin);
-        targetUid = String((det && det.detail && (det.detail.uid || (det.detail.simpleInfo && det.detail.simpleInfo.uid))) || '');
-      } catch (e) {
-        return { status: 'failed', retcode: 1500, data: { action: action.action, targetUin: action.targetUin },
-          message: 'getUserDetailInfoByUin 抛错：' + String(e && e.message ? e.message : e).slice(0, 140) };
-      }
-      if (!targetUid) {
-        return { status: 'failed', retcode: 1404, data: { action: action.action, targetUin: action.targetUin },
-          message: '拿不到目标 peerUid（getUserDetailInfoByUin 返回空 uid）' };
+      if (action.targetChatType === 2) {
+        targetUid = String(action.targetUin);
+      } else {
+        try {
+          const profileSvc = session.getProfileService();
+          const det = await profileSvc.getUserDetailInfoByUin(action.targetUin);
+          targetUid = String((det && det.detail && (det.detail.uid || (det.detail.simpleInfo && det.detail.simpleInfo.uid))) || '');
+        } catch (e) {
+          return { status: 'failed', retcode: 1500, data: { action: action.action, targetUin: action.targetUin },
+            message: 'getUserDetailInfoByUin 抛错：' + String(e && e.message ? e.message : e).slice(0, 140) };
+        }
+        if (!targetUid) {
+          return { status: 'failed', retcode: 1404, data: { action: action.action, targetUin: action.targetUin },
+            message: '拿不到目标 peerUid（getUserDetailInfoByUin 返回空 uid）' };
+        }
       }
       const msgSvc = session.getMsgService();
       if (!msgSvc || typeof msgSvc.forwardMsg !== 'function') {
@@ -1026,12 +1033,6 @@ function createActionHandler(session, self, current, options = {}) {
     }
     if (action.kind === 'get_login_info') return { user_id: Number(self.uin), nickname: '' };
         if (action.kind === 'get_status') return { online: true, good: true };
-        if (action.kind === 'forward') {
-          if (typeof options.expandForward !== 'function') throw fail('当前会话不支持获取合并转发', 1500);
-          const messages = await options.expandForward(action.ref);
-          ensure();
-          return { self, forward: { ref: action.ref, messages } };
-        }
         if (action.kind === 'get_msg') {
           if (typeof options.fetchMessage !== 'function') throw fail('当前会话不支持读取消息', 1500);
           const message = await options.fetchMessage(action.ref);

@@ -69,6 +69,13 @@ function resolveReferences(converter, request) {
     if (ref?.kind !== 'message') throw fail('message_id 不存在或已过期（仅支持本次运行期间收发过或被引用的消息）', 1404);
     return { ...request, params: { ...params, openqq_ref: { chatType: ref.chatType, peerUid: ref.peerUid, msgId: ref.msgId } } };
   }
+  // 转发单条消息：native 侧靠 p.openqq_ref 拿源消息的真 msgId 与源会话的 peerUid。
+  // 主进程不在这里把引用附上，它就永远拿到空引用 —— 表现是「动作存在但一调就 1404」。
+  if (request.action === 'forward_friend_single_msg' || request.action === 'forward_group_single_msg') {
+    const ref = converter.resolve(params.message_id);
+    if (ref?.kind !== 'message') throw fail('message_id 不存在或已过期（仅支持本次运行期间收到的消息）', 1404);
+    return { ...request, params: { ...params, openqq_ref: { chatType: ref.chatType, peerUid: ref.peerUid, msgId: ref.msgId } } };
+  }
   if (!sendActions.includes(request.action) || !Array.isArray(params.message)) return request;
   const message = params.message.map(segment => {
     if (segment?.type !== 'reply') return segment;
