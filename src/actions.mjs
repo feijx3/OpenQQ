@@ -64,7 +64,10 @@ function resolveReferences(converter, request) {
     if (ref?.kind !== 'message') throw fail('message_id 不存在或已过期（仅支持本次运行期间收发过的消息）', 1404);
     return { ...request, params: { ...params, openqq_ref: { chatType: ref.chatType, peerUid: ref.peerUid, msgId: ref.msgId } } };
   }
-  if (request.action === 'get_msg' || request.action === 'set_msg_emoji_like') {
+  // 这几个动作在 native 侧都靠 p.openqq_ref 拿源消息的 msgId/peerUid，主进程必须先把引用附上，
+  // 否则它们永远拿到空引用、只能回 1404。
+  if (request.action === 'get_msg' || request.action === 'set_msg_emoji_like'
+    || request.action === 'get_msg_emoji_likes' || request.action === 'fetch_emoji_like') {
     const ref = converter.resolve(params.message_id);
     if (ref?.kind !== 'message') throw fail('message_id 不存在或已过期（仅支持本次运行期间收发过或被引用的消息）', 1404);
     return { ...request, params: { ...params, openqq_ref: { chatType: ref.chatType, peerUid: ref.peerUid, msgId: ref.msgId } } };

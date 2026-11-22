@@ -372,14 +372,6 @@ function createActionHandler(session, self, current, options = {}) {
   // 我们只负责告诉它"这一次 body 用我的字节"（arm），然后调 QQ 自己的
   // Msg.sendSsoCmdReqByContend —— 包由 QQ 发、回包也由 QQ 收，不做任何内存扫描。
   // 同一条命令在两个服务名前缀下可达性不同（有的会静默丢包），空回包时换另一个前缀再试一次。
-  const namesOf = value => {
-    if (!value || (typeof value !== 'object' && typeof value !== 'function')) return [];
-    const set = new Set();
-    for (let o = value; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
-      for (const n of Object.getOwnPropertyNames(o)) if (n !== 'constructor') set.add(n);
-    }
-    return Array.from(set).sort();
-  };
   const serviceOf = name => {
     const key = String(name ?? '');
     if (!/^[A-Za-z][A-Za-z0-9]{0,40}$/.test(key)) return null;
@@ -561,17 +553,33 @@ function createActionHandler(session, self, current, options = {}) {
       const callArgs = Array.isArray(action.args) ? action.args.slice() : [];
       const cbIndex = Number.isSafeInteger(action.cbIndex) ? action.cbIndex : -1;
       let cbValue; let cbCalled = false;
+      // 内核里有一批方法「同步返回 undefined、结果从最后一个参数的回调交回」。
+      // 只靠 Promise.race([Promise.resolve(返回), 超时]) 是不行的：Promise.resolve(undefined)
+      // 会在下一个微任务立刻 resolve，于是回调还没来就已经拿着 undefined 走了。
+      // 所以有 cbIndex 时单独造一个由回调 resolve 的 Promise，并在「返回值是空」时改等它。
+      let settleCallback = null;
+      const callbackLanded = new Promise(resolve => { settleCallback = resolve; });
       if (cbIndex >= 0 && cbIndex < callArgs.length) {
-        callArgs[cbIndex] = (...cbArgs) => { cbCalled = true; cbValue = cbArgs.length <= 1 ? cbArgs[0] : cbArgs; };
+        callArgs[cbIndex] = (...cbArgs) => {
+          cbCalled = true;
+          cbValue = cbArgs.length <= 1 ? cbArgs[0] : cbArgs;
+          if (settleCallback) settleCallback(cbValue);
+        };
       }
       try {
         // 有些方法既不 return 也不回调（参数形状不对时内核会把调用吞掉），
         // 不设上限就会把这一次动作永久挂住，所以给一个有回调的等久一点、没回调的等短一点。
         const waitMs = cbIndex >= 0 ? 12000 : 6000;
-        const value = await Promise.race([
-          Promise.resolve(fn.apply(svc, callArgs)),
-          new Promise((_, reject) => { const t = setTimeout(() => reject(new Error('原生调用超时：该方法既没有同步返回也没有触发回调')), waitMs); if (t.unref) t.unref(); }),
-        ]);
+        const neverSettles = () => new Promise((_, reject) => {
+          const t = setTimeout(() => reject(new Error('原生调用超时：该方法既没有同步返回也没有触发回调')), waitMs);
+          if (t.unref) t.unref();
+        });
+        const returned = await Promise.race([Promise.resolve(fn.apply(svc, callArgs)), neverSettles()]);
+        // 只有「同步/异步返回值是空、且确实挂了回调」时才继续等回调；有返回值就以返回值为准，
+        // 不因为回调晚到而覆盖它。
+        const value = (returned === undefined || returned === null) && cbIndex >= 0 && cbIndex < callArgs.length
+          ? await Promise.race([callbackLanded, neverSettles()])
+          : returned;
         const effective = (value === undefined || value === null) && cbCalled ? cbValue : value;
         let out = effective;
         try { out = JSON.parse(JSON.stringify(effective === undefined ? null : effective)); } catch { out = String(effective); }
