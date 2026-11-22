@@ -71,12 +71,12 @@ test('keepZero writes an explicit zero so a setting can be turned off', () => {
 test('turning a group setting off still sends the field', () => {
   // 「群被永久禁言、怎么关都关不掉」就是这条退化：state:0 被当成默认值省略，
   // 外层 message 又因内层为空整块跳过，body 只剩群号。
-  const muteOff = oidb.buildOidbBody('set_group_whole_mute', { group_id: 1041147387, enable: false });
+  const muteOff = oidb.buildOidbBody('set_group_whole_mute', { group_id: 123456, enable: false });
   assert.match(muteOff.toString('hex'), /12020800$/, '关闭禁言必须带上 state:0');
-  const history = oidb.buildOidbBody('set_group_new_member_history_visibility', { group_id: 1041147387, visible: false });
+  const history = oidb.buildOidbBody('set_group_new_member_history_visibility', { group_id: 123456, visible: false });
   assert.match(history.toString('hex'), /1204/, '历史可见性要带 settings 块');
   // 打开时本来就是 1，不该被 keepZero 影响。
-  const muteOn = oidb.buildOidbBody('set_group_whole_mute', { group_id: 1041147387, enable: true });
+  const muteOn = oidb.buildOidbBody('set_group_whole_mute', { group_id: 123456, enable: true });
   assert.match(muteOn.toString('hex'), /12020801$/);
 });
 
@@ -88,18 +88,18 @@ test('wrapOidbBase emits command/subCommand/errorCode/body and only adds reserve
 
 test('buildOidbPoke keeps the verified group shape', () => {
   assert.equal(
-    pb.buildOidbPoke({ groupId: 1041147387, userId: 2975434328 }).toString('hex'),
-    '08d31d10011800221008d88ce68a0b10fbcbbaf00328003000'
+    pb.buildOidbPoke({ groupId: 123456, userId: 987654 }).toString('hex'),
+    '08d31d10011800220c0886a43c10c0c40728003000'
   );
 });
 
 test('whole-group setting rewrites stay un-sent until confirmed', () => {
-  const dry = actions.validateAction({ action: 'set_group_whole_mute', params: { group_id: 1041147387, enable: false } });
+  const dry = actions.validateAction({ action: 'set_group_whole_mute', params: { group_id: 123456, enable: false } });
   assert.equal(dry.kind, 'oidb_dryrun');
   assert.ok(dry.bodyLen > 0, 'dryrun 仍要给出将要发送的字节');
-  const armed = actions.validateAction({ action: 'set_group_whole_mute', params: { group_id: 1041147387, enable: false, confirm_danger: true } });
+  const armed = actions.validateAction({ action: 'set_group_whole_mute', params: { group_id: 123456, enable: false, confirm_danger: true } });
   assert.equal(armed.kind, 'sso_pipe');
   // 只读动作不该被 danger 拦住。
-  const read = actions.validateAction({ action: 'get_group_todo_list', params: { group_id: 1041147387 } });
+  const read = actions.validateAction({ action: 'get_group_todo_list', params: { group_id: 123456 } });
   assert.equal(read.kind, 'sso_pipe');
 });
