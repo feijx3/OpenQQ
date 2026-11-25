@@ -1,4 +1,5 @@
 #include "bootstrap.hpp"
+#include "packet.hpp"
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -42,6 +43,7 @@ extern "C" __declspec(dllexport) void* OpenQQBootstrap(void* env, void* exports,
         check(open(env, &scope));
         void *object = nullptr, *source = nullptr, *value = nullptr, *escaped = nullptr;
         check(global(env, &object));
+        InstallPacketBridge(env, runtime, config->original, object);
         check(set(env, object, "__openqq_exports", result ? result : exports));
         check(string(env, config->source, SIZE_MAX, &source));
         check(run(env, source, &value));

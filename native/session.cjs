@@ -2,6 +2,7 @@
 
 const { createEventReceiver } = require('./events.cjs');
 const { createActionHandler } = require('./actions.cjs');
+const { configureNativePacket } = require('./packet-native.cjs');
 
 // Only the client-created session is observed; login tickets never leave QQ.
 function createSessionHook(report) {
@@ -187,6 +188,7 @@ function createSessionHook(report) {
 
 function startNative(config, wrapper) {
   if (globalThis.__openqq_hook) throw new Error('OpenQQ 已挂接');
+  configureNativePacket(config.qqVersion);
   const socket = require('node:net').createConnection(config.pipe);
   function write(event) {
     if (socket.writableLength > 1024 * 1024) { connection.dispose(); return; }

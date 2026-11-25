@@ -2,6 +2,7 @@
 
 const { fail, identifier, flag, integer, nativeId } = require('./common.cjs');
 const { memberOf } = require('./admin.cjs');
+const { getGroupFileUrl } = require('./group-file.cjs');
 
 const absolutePath = value => typeof value === 'string' && value.length <= 4096 && !/[\u0000-\u001f]/.test(value)
   && /^(?:[A-Za-z]:[\\/]|\/)/.test(value) && !/^(?:\\\\|\/\/)/.test(value);
@@ -613,21 +614,10 @@ async function run(action, ctx) {
       return { ok: true, result: res ?? null };
     }
     case 'get_group_file_url': {
-      const svc = rich();
-      let url = '';
-      if (typeof svc.getGroupFileInfo === 'function') {
-        try {
-          const info = await svc.getGroupFileInfo(action.group, action.fileId);
-          url = String(info?.fileInfo?.downloadUrl ?? info?.url ?? '');
-        } catch { /* fallback below */ }
-      }
       ensure();
-      if (!url && ctx.lookupMedia) {
-        const cached = ctx.lookupMedia(action.fileId);
-        if (cached?.url) url = cached.url;
-      }
-      if (!url) throw fail('无法直接获取群文件下载链接（QQ 客户端未返回直链，可尝试通过消息触发 get_file）', 1500);
-      return { url };
+      const cached = ctx.lookupMedia?.(action.fileId);
+      if (typeof cached?.url === 'string' && /^https?:\/\//i.test(cached.url)) return { url: cached.url };
+      return { url: await getGroupFileUrl(session, action, ensure) };
     }
     case 'friends_with_category': {
       if (typeof ctx.friendsWithCategory !== 'function') throw fail('当前会话不支持获取好友分组列表', 1500);
