@@ -28,11 +28,19 @@ function createPacketBootstrap(options = {}) {
     if (initializationError) throw initializationError;
 
     try {
-      if (platform !== 'win32' || arch !== 'x64') {
-        throw new Error('当前群文件原生通道仅适配 Windows x64');
+      if (typeof version !== 'string' || !version.trim()) {
+        throw new Error('缺少 QQ 版本号，未安装原生通道；请重新构建并重启 QQ');
+      }
+      if (platform !== 'win32') {
+        const environment = platform === 'linux' ? 'Linux（含 Docker Linux 容器）' : platform;
+        throw new Error(environment + ' 尚未适配群文件原生通道；当前仅支持 Windows x64，未安装 Hook');
+      }
+      if (arch !== 'x64') {
+        throw new Error('Windows ' + arch + ' 尚未适配群文件原生通道；当前仅支持 Windows x64');
       }
       const native = load();
-      if (typeof native?.initialize !== 'function' || typeof native?.send !== 'function') {
+      if (typeof native?.initialize !== 'function' || typeof native?.send !== 'function'
+        || typeof native?.release !== 'function') {
         throw new Error('OpenQQ packet bridge 导出不完整');
       }
       initializedVersion = version;
@@ -53,24 +61,43 @@ function createPacketBootstrap(options = {}) {
 // an actual packet request. Cached media URLs and unrelated actions need no hook.
 // Keep successful hooks alive until QQ exits, including across session rebuilds.
 const initialize = createPacketBootstrap();
-let active;
 let configuredVersion;
 
 function configureNativePacket(version) {
+  if (typeof version !== 'string' || !version.trim()) {
+    throw fail('缺少 QQ 版本号，未安装原生通道；请重新构建并重启 QQ', 1500);
+  }
   configuredVersion = version;
 }
 
-function ensureNativePacket(version) {
-  active = initialize(version);
-  return active;
-}
-
-function getPacketSender() {
-  if (!active && configuredVersion === undefined) return undefined;
+// Native send returns a promise plus an opaque tracking ID. Releasing this
+// handle only erases OpenQQ bookkeeping; QQ still owns its deferred/promise.
+function createPacketSender(ensurePacket) {
   return (service, command, data) => {
-    const state = active ?? ensureNativePacket(configuredVersion);
-    return state.native.send(service, command, data);
+    const state = ensurePacket();
+    const handle = state.native.send(service, command, data);
+    if (!handle || typeof handle.id !== 'string' || !/^[1-9]\d*$/.test(handle.id)
+      || typeof handle.promise?.then !== 'function') {
+      if (typeof handle?.id === 'string' && /^[1-9]\d*$/.test(handle.id)) {
+        state.native.release(handle.id);
+      }
+      throw fail('OpenQQ 原生通道返回无效的请求句柄；请重新构建并重启 QQ', 1500);
+    }
+    let released = false;
+    return {
+      promise: handle.promise,
+      release() {
+        if (released) return;
+        released = true;
+        state.native.release(handle.id);
+      },
+    };
   };
 }
 
-module.exports = { configureNativePacket, createPacketBootstrap, getPacketSender };
+function getPacketSender() {
+  // Never interpret missing configuration as a test-mode bypass.
+  return createPacketSender(() => initialize(configuredVersion));
+}
+
+module.exports = { configureNativePacket, createPacketBootstrap, createPacketSender, getPacketSender };

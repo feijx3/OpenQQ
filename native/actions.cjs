@@ -477,6 +477,7 @@ function createActionHandler(session, self, current, options = {}) {
             waitFor: options.waitFor,
             lookupRecent: options.lookupRecent,
             lookupMedia: options.lookupMedia,
+            sendPacket: options.sendPacket,
             resolveUin: options.resolveUin,
             friendsWithCategory: options.friendsWithCategory,
             uidFor: uin => needUid(uin, ['convert', 'profile', 'group'], '无法把 QQ 号转换为 UID；未调用 QQ'),

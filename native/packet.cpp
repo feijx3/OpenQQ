@@ -21,7 +21,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -143,7 +143,84 @@ CreateString originalCreateString = nullptr;
 // flags are restored on nested callbacks; ordinary QQ API calls pass through.
 thread_local bool isRawRequest = false, isRawResponse = false;
 std::mutex pendingDeferredsMutex, initializationMutex;
-std::unordered_set<void *> pendingDeferreds;
+// These records own no QQ memory. IDs make cleanup independent of callback
+// object lifetime and prevent a late release from erasing a reused deferred.
+using RequestId = uint64_t;
+struct TrackedRequest {
+    uint64_t expiresAt;
+    std::vector<void *> deferreds;
+};
+constexpr uint64_t kTrackingLifetimeMs = 30000;
+std::unordered_map<void *, RequestId> pendingDeferreds;
+std::unordered_map<RequestId, TrackedRequest> pendingRequests;
+RequestId nextRequestId = 1;
+thread_local RequestId activeRequestId = 0;
+uint64_t (*monotonicMilliseconds)() = []() -> uint64_t { return GetTickCount64(); };
+
+void releasePacketRequestLocked(RequestId id) {
+    const auto request = pendingRequests.find(id);
+    if (request == pendingRequests.end())
+        return;
+    for (auto deferred : request->second.deferreds) {
+        const auto owner = pendingDeferreds.find(deferred);
+        if (owner != pendingDeferreds.end() && owner->second == id)
+            pendingDeferreds.erase(owner);
+    }
+    pendingRequests.erase(request);
+}
+void releasePacketRequest(RequestId id) {
+    std::lock_guard<std::mutex> lock(pendingDeferredsMutex);
+    releasePacketRequestLocked(id);
+}
+RequestId beginPacketRequest() {
+    std::lock_guard<std::mutex> lock(pendingDeferredsMutex);
+    const auto now = monotonicMilliseconds();
+    for (auto request = pendingRequests.begin(); request != pendingRequests.end();) {
+        const auto id = request->first;
+        const bool expired = request->second.expiresAt <= now;
+        ++request;
+        if (expired)
+            releasePacketRequestLocked(id);
+    }
+    if (pendingRequests.size() >= kMaxPendingRequests)
+        throw std::runtime_error("too many pending native packet requests");
+    if (!nextRequestId)
+        throw std::runtime_error("native packet request ID exhausted");
+    const auto id = nextRequestId++;
+    pendingRequests.emplace(id, TrackedRequest{now + kTrackingLifetimeMs, {}});
+    return id;
+}
+void rememberDeferred(RequestId id, void *deferred) {
+    std::lock_guard<std::mutex> lock(pendingDeferredsMutex);
+    auto request = pendingRequests.find(id);
+    if (request == pendingRequests.end())
+        return;
+    const auto owner = pendingDeferreds.find(deferred);
+    if (owner != pendingDeferreds.end() && owner->second == id)
+        return;
+    request->second.deferreds.push_back(deferred);
+    pendingDeferreds[deferred] = id;
+}
+bool claimDeferred(void *deferred) {
+    std::lock_guard<std::mutex> lock(pendingDeferredsMutex);
+    const auto owner = pendingDeferreds.find(deferred);
+    if (owner == pendingDeferreds.end())
+        return false;
+    const auto request = pendingRequests.find(owner->second);
+    if (request == pendingRequests.end()) {
+        pendingDeferreds.erase(owner);
+        return false;
+    }
+    if (request->second.expiresAt <= monotonicMilliseconds()) {
+        releasePacketRequestLocked(owner->second);
+        return false;
+    }
+    // QQ invokes this completion once. Forget the identity before handing
+    // control back: the callback may free both its context and its object.
+    pendingDeferreds.erase(owner);
+    return true;
+}
+
 bool bridgeInstalled = false;
 std::string initializationError;
 
@@ -177,6 +254,26 @@ struct ScopedFlag {
         flag = old;
     }
 };
+// If N-API reports a synchronous exception, or constructing the JS handle
+// fails, no caller receives an ID to release. Roll back tracking automatically.
+// A successful send transfers cleanup to JS's finally; expiry is a backstop.
+struct PacketRequestScope {
+    RequestId id;
+    RequestId previousId;
+    bool previousRaw;
+    bool committed = false;
+    PacketRequestScope() : id(beginPacketRequest()), previousId(activeRequestId), previousRaw(isRawRequest) {
+        activeRequestId = id;
+        isRawRequest = true;
+    }
+    ~PacketRequestScope() {
+        activeRequestId = previousId;
+        isRawRequest = previousRaw;
+        if (!committed)
+            releasePacketRequest(id);
+    }
+};
+
 // Do not reinterpret output as this compiler's std::string: MSVC and QQ's
 // libc++ have different layouts and allocators. Ask the original converter to
 // allocate an equally-sized ASCII string, then overwrite its data, keeping its
@@ -210,13 +307,11 @@ void *convertPacketArgument(void *output, Env env, Value value) {
     return result;
 }
 // Intercept only wrapper.node's import slot, not the runtime-wide N-API export.
-// Promise handles remain QQ-owned; the set stores identity, never ownership.
+// Promise handles remain QQ-owned; the registry stores identities, never ownership.
 int trackCreatedPromise(Env env, void **deferred, Value *promise) {
-    int status = originalCreatePromise(env, deferred, promise);
-    if (!status && isRawRequest && deferred && *deferred) {
-        std::lock_guard<std::mutex> lock(pendingDeferredsMutex);
-        pendingDeferreds.insert(*deferred);
-    }
+    const int status = originalCreatePromise(env, deferred, promise);
+    if (!status && isRawRequest && activeRequestId && deferred && *deferred)
+        rememberDeferred(activeRequestId, *deferred);
     return status;
 }
 // Both checks are necessary: errMsg is also serialized as UTF-8 in this callback.
@@ -239,24 +334,16 @@ int createStringOrPacketBuffer(Env env, const char *text, size_t length, Value *
     return createResponseValue(env, text, length, result, caller);
 }
 void completePacketResponse(void *object) {
-    // These are private ABI fields, described by the selected verified profile.
-    // QQ clears the deferred after resolving it; only then forget its identity.
-    // Do not cancel/free it on JS timeout: QQ may still complete the request.
+    // Read the private ABI fields only while QQ still owns the callback object.
+    // Once the original callback runs, neither object nor context may be alive.
     auto context = *reinterpret_cast<unsigned char **>(static_cast<unsigned char *>(object) +
                                                        activeProfile->callbackContextOffset);
     void *deferred =
         context ? *reinterpret_cast<void **>(context + activeProfile->contextDeferredOffset) : nullptr;
-    bool ours = false;
-    if (deferred) {
-        std::lock_guard<std::mutex> lock(pendingDeferredsMutex);
-        ours = pendingDeferreds.count(deferred) != 0;
-    }
+    const bool ours = deferred && claimDeferred(deferred);
     ScopedFlag scope(isRawResponse, ours);
     originalResponseCallback(object);
-    if (ours && !*reinterpret_cast<void **>(context + activeProfile->contextDeferredOffset)) {
-        std::lock_guard<std::mutex> lock(pendingDeferredsMutex);
-        pendingDeferreds.erase(deferred);
-    }
+    // No reads of object/context here, including on the exception path.
 }
 // Locate this module's IAT entry by symbol name. The response call instruction is
 // separately checked to reference the same slot, preventing an incorrect site
@@ -301,7 +388,7 @@ struct EntryDetour {
     EntryDetour(uintptr_t address, const unsigned char *signature, size_t length, void *hook)
         : target(reinterpret_cast<unsigned char *>(address)), size(length), trampoline(nullptr) {
         if (length < kAbsoluteJumpBytes || length > before.size() || std::memcmp(target, signature, length))
-            throw std::runtime_error("wrapper instruction signature mismatch; hook not bridgeInstalled");
+            throw std::runtime_error("wrapper instruction signature mismatch; hook not installed");
         std::memcpy(before.data(), target, size);
         after.fill(0x90);
         writeAbsoluteJump(after.data(), hook);
@@ -410,8 +497,8 @@ void initialize(const std::string &version) {
     try {
         const auto profile = findPacketProfile(version);
         if (!profile)
-            throw std::runtime_error("unsupported QQ packet profile: " + version + " (verified: " +
-                                     supportedVersionList() + ")");
+            throw std::runtime_error("unsupported QQ packet profile: " + version +
+                                     " (verified: " + supportedVersionList() + ")");
         auto dos = reinterpret_cast<IMAGE_DOS_HEADER *>(wrapperBase);
         auto nt = reinterpret_cast<IMAGE_NT_HEADERS64 *>(wrapperBase + dos->e_lfanew);
         if (nt->FileHeader.TimeDateStamp != profile->peTimestamp ||
@@ -503,18 +590,45 @@ Value sendCallback(Env env, void *info) {
         check(api.getBuffer(env, argv[2], &data, &size), "packet size");
         if (size > kMaxPacketBytes)
             throw std::runtime_error("packet exceeds 1 MiB");
-        {
-            std::lock_guard<std::mutex> lock(pendingDeferredsMutex);
-            if (pendingDeferreds.size() >= kMaxPendingRequests)
-                throw std::runtime_error("too many pendingDeferreds native packet requests");
-        }
-        Value method = nullptr, result = nullptr;
+        Value method = nullptr, promise = nullptr;
         check(api.get(env, argv[0], "sendSsoCmdReqByContend", &method), "send method");
-        ScopedFlag scope(isRawRequest, true);
-        const int status = api.call(env, argv[0], method, 2, argv + 1, &result);
+        PacketRequestScope request;
+        const int status = api.call(env, argv[0], method, 2, argv + 1, &promise);
         if (status == kNapiPendingException)
-            return nullptr; // Preserve the original pendingDeferreds JS exception.
+            return nullptr; // Keep QQ's JS exception; request scope cleans tracking.
         check(status, "native send");
+
+        // No N-API reference is retained. QQ owns the promise/deferred; only an
+        // opaque string ID crosses the bridge so JS can release tracking later.
+        Value handle = nullptr, id = nullptr;
+        const auto idText = std::to_string(request.id);
+        check(api.createObject(env, &handle), "create packet request handle");
+        check(originalCreateString(env, idText.data(), idText.size(), &id), "create packet request ID");
+        check(api.set(env, handle, "promise", promise), "set packet promise");
+        check(api.set(env, handle, "id", id), "set packet request ID");
+        request.committed = true;
+        return handle;
+    } catch (const std::exception &error) {
+        api.throwError(env, nullptr, error.what());
+        return nullptr;
+    }
+}
+Value releaseCallback(Env env, void *info) {
+    try {
+        Value argv[1]{};
+        size_t count = 1;
+        check(api.getArgs(env, info, &count, argv, nullptr, nullptr), "release arguments");
+        if (count != 1)
+            throw std::runtime_error("release requires a packet request ID");
+        const auto text = stringArg(env, argv[0]);
+        if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos)
+            throw std::runtime_error("invalid packet request ID");
+        const auto id = std::stoull(text);
+        if (!id)
+            throw std::runtime_error("invalid packet request ID");
+        releasePacketRequest(id); // Idempotent, including after expiry/completion.
+        Value result = nullptr;
+        check(api.boolean(env, true, &result), "release result");
         return result;
     } catch (const std::exception &error) {
         api.throwError(env, nullptr, error.what());
@@ -553,11 +667,90 @@ void InstallPacketBridge(void *env, HMODULE runtime, AddonInit original, void *g
     NAPI(boolean, "napi_get_boolean");
     NAPI(throwError, "napi_throw_error");
 #undef NAPI
-    Value bridge = nullptr, init = nullptr, send = nullptr;
+    Value bridge = nullptr, init = nullptr, send = nullptr, release = nullptr;
     check(api.createObject(env, &bridge), "bridge object");
     check(api.createFunction(env, "initialize", SIZE_MAX, initCallback, nullptr, &init), "bridge initialize");
     check(api.createFunction(env, "send", SIZE_MAX, sendCallback, nullptr, &send), "bridge send");
+    check(api.createFunction(env, "release", SIZE_MAX, releaseCallback, nullptr, &release), "bridge release");
+    check(api.set(env, bridge, "release", release), "set release");
     check(api.set(env, bridge, "initialize", init), "set initialize");
     check(api.set(env, bridge, "send", send), "set send");
     check(api.set(env, global, "__openqq_packet", bridge), "publish packet bridge");
 }
+
+#ifdef OPENQQ_PACKET_TESTING
+#include "packet-test.hpp"
+
+PacketBridgeTestAccess GetPacketBridgeTestAccess() {
+    PacketBridgeTestAccess access{};
+    access.configure = [](const PacketTestMocks &mock) {
+        api.getArgs = mock.getArgs;
+        api.getString = mock.getString;
+        api.isBuffer = mock.isBuffer;
+        api.getBuffer = mock.getBuffer;
+        api.createBuffer = mock.createBuffer;
+        api.createObject = mock.createObject;
+        api.set = mock.set;
+        api.get = mock.get;
+        api.call = mock.call;
+        api.boolean = mock.boolean;
+        api.throwError = mock.throwError;
+        originalCreateString = mock.createString;
+        originalCreatePromise = mock.createPromise;
+        originalStringConverter = mock.convert;
+        originalResponseCallback = mock.response;
+        monotonicMilliseconds = mock.now;
+        std::lock_guard<std::mutex> lock(pendingDeferredsMutex);
+        pendingDeferreds.clear();
+        pendingRequests.clear();
+        nextRequestId = 1;
+        activeRequestId = 0;
+        isRawRequest = isRawResponse = false;
+        bridgeInstalled = true;
+        activeProfile = findPacketProfile("9.9.33-52230");
+    };
+    access.supportsVersion = [](const char *version) { return findPacketProfile(version) != nullptr; };
+    access.beginRequest = beginPacketRequest;
+    access.releaseRequest = releasePacketRequest;
+    access.setRawRequest = [](RequestId id) {
+        activeRequestId = id;
+        isRawRequest = id != 0;
+    };
+    access.setRawResponse = [](bool enabled) { isRawResponse = enabled; };
+    access.rawResponse = [] { return isRawResponse; };
+    access.rawRequestId = [] { return activeRequestId; };
+    access.requestCount = [] {
+        std::lock_guard<std::mutex> lock(pendingDeferredsMutex);
+        return pendingRequests.size();
+    };
+    access.deferredCount = [] {
+        std::lock_guard<std::mutex> lock(pendingDeferredsMutex);
+        return pendingDeferreds.size();
+    };
+    access.claim = claimDeferred;
+    access.trackPromise = trackCreatedPromise;
+    access.convert = convertPacketArgument;
+    access.createResponse = createResponseValue;
+    access.completeResponse = completePacketResponse;
+    access.responseReturnAddress = responseStringReturnAddress;
+    access.send = sendCallback;
+    access.release = releaseCallback;
+    access.createDetour = [](void *target, const unsigned char *bytes, size_t size, void *replacement) {
+        auto patch = new EntryDetour(reinterpret_cast<uintptr_t>(target), bytes, size, replacement);
+        return PacketTestDetour{patch, patch->trampoline};
+    };
+    access.writeDetour = [](void *patch, bool restore) {
+        return writeEntryDetour(*static_cast<EntryDetour *>(patch), restore);
+    };
+    access.destroyDetour = [](void *value) {
+        auto patch = static_cast<EntryDetour *>(value);
+        VirtualFree(patch->trampoline, 0, MEM_RELEASE);
+        delete patch;
+    };
+    access.prologue = k52230StringConverterPrologue;
+    access.prologueSize = sizeof(k52230StringConverterPrologue);
+    access.maxRequests = kMaxPendingRequests;
+    access.trackingLifetimeMs = kTrackingLifetimeMs;
+    return access;
+}
+#endif

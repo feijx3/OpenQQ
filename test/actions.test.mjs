@@ -167,7 +167,7 @@ test('IPC rejects pre-connection actions and cancels an in-flight request on dis
   t.after(() => channel.close());
   await assert.rejects(channel.request(send()), error => error.retcode === 1502);
   const connected = once(channel.events, 'connected');
-  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token }, { NodeIQQNTWrapperSession: { get: () => session } });
+  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token, qqVersion: "9.9.33-52230" }, { NodeIQQNTWrapperSession: { get: () => session } });
   t.after(() => globalThis.__openqq_hook?.dispose());
   let submitted;
   const submittedPromise = new Promise(resolve => { submitted = resolve; });
@@ -230,7 +230,7 @@ test('authenticated IPC runs a text send and typing action end-to-end with a sha
     getUixConvertService: () => ({ getUid: async () => ({ uidInfo: new Map([['654321', 'u_target']]) }) }),
   };
   const connected = once(channel.events, 'connected');
-  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token }, { NodeIQQNTWrapperSession: { get: () => session } });
+  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token, qqVersion: "9.9.33-52230" }, { NodeIQQNTWrapperSession: { get: () => session } });
   t.after(() => globalThis.__openqq_hook?.dispose());
   await connected;
   const converter = createEventConverter();
@@ -272,7 +272,7 @@ test('get_image validates parameters, resolves received images via IPC and enric
     getUixConvertService: () => ({ getUid: async () => ({ uidInfo: new Map() }) }),
   };
   const connected = once(channel.events, 'connected');
-  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token }, { NodeIQQNTWrapperSession: { get: () => session } });
+  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token, qqVersion: "9.9.33-52230" }, { NodeIQQNTWrapperSession: { get: () => session } });
   t.after(() => globalThis.__openqq_hook?.dispose());
   await connected;
   const ready = new Promise(resolve => channel.events.on('event', event => { if (event.type === 'session_ready') resolve(); }));

@@ -617,7 +617,7 @@ async function run(action, ctx) {
       ensure();
       const cached = ctx.lookupMedia?.(action.fileId);
       if (typeof cached?.url === 'string' && /^https?:\/\//i.test(cached.url)) return { url: cached.url };
-      return { url: await getGroupFileUrl(session, action, ensure) };
+      return { url: await getGroupFileUrl(session, action, ensure, { sendPacket: ctx.sendPacket }) };
     }
     case 'friends_with_category': {
       if (typeof ctx.friendsWithCategory !== 'function') throw fail('当前会话不支持获取好友分组列表', 1500);

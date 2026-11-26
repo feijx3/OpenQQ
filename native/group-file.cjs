@@ -150,30 +150,39 @@ function parseResponse(input) {
   return new URL('https://' + host + '/ftn_handler/' + ticket.toString('hex') + '/?fname=').href;
 }
 
-async function getGroupFileUrl(session, action, ensure, timeoutMs = DOWNLOAD_TIMEOUT_MS) {
+async function getGroupFileUrl(session, action, ensure, {
+  timeoutMs = DOWNLOAD_TIMEOUT_MS,
+  sendPacket = getPacketSender(),
+} = {}) {
   const service = session.getMsgService?.();
   if (typeof service?.sendSsoCmdReqByContend !== 'function') {
     throw fail('当前 QQ 不支持群文件下载所需的 sendSsoCmdReqByContend', 1500);
   }
   const request = buildRequest(action.group, action.fileId, action.busid);
   let timer;
+  let release;
   try {
     ensure();
+    // sendPacket is a production bridge by default; mocks must be passed
+    // explicitly. Its handle releases tracking, never QQ-owned promise memory.
+    const handle = sendPacket(service, COMMAND, request);
+    if (!handle || typeof handle.release !== 'function') {
+      throw new Error('原生通道未返回可释放的请求句柄');
+    }
+    release = () => handle.release();
+    if (typeof handle.promise?.then !== 'function') {
+      throw new Error('原生通道未返回请求 Promise');
+    }
     const response = await Promise.race([
-      Promise.resolve().then(() => {
-        // Production startup configures the bridge. A directly supplied service
-        // remains usable by the isolated protocol tests without loading native code.
-        const send = getPacketSender();
-        return send ? send(service, COMMAND, request) : service.sendSsoCmdReqByContend(COMMAND, request);
-      }),
+      handle.promise,
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(fail(
           '群文件下载链接请求超时（OIDB 0x6D6/2）；QQ 未返回响应，请确认文件 ID 来自当前协议端', 1501,
         )), timeoutMs);
       }),
     ]);
-    // The native request cannot be cancelled by Promise.race. Discard late data
-    // after session replacement/disposal instead of continuing an expired action.
+    // A timeout stops waiting, not QQ itself. The finally block removes only
+    // tracking; a later QQ completion follows its ordinary callback path.
     ensure();
 
     const nativeResult = Number.isFinite(response?.result) ? String(response.result) : 'missing';
@@ -201,6 +210,7 @@ async function getGroupFileUrl(session, action, ensure, timeoutMs = DOWNLOAD_TIM
     throw fail('获取群文件下载链接失败（OIDB 0x6D6/2）: ' + error.message, 1500);
   } finally {
     clearTimeout(timer);
+    release?.();
   }
 }
 

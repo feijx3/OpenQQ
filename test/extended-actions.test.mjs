@@ -263,6 +263,12 @@ function createHarness(overrides = {}) {
   const receiver = createEventReceiver(session, self, e => rawEvents.push(e), () => true);
   const convert = createEventConverter();
   handler = nativeActions.createActionHandler(session, self, () => true, {
+    // Explicit fake transport: production must never infer test mode from a
+    // missing QQ version.
+    sendPacket: (service, command, data) => ({
+      promise: service.sendSsoCmdReqByContend(command, data),
+      release() {},
+    }),
     groups: receiver.groups,
     friendList: receiver.friendList,
     friendsWithCategory: receiver.friendsWithCategory,
