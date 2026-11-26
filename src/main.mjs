@@ -196,7 +196,7 @@ async function start(qq, config, existingWebUI) {
   });
   const wrapper = resolveLinuxWrapper(qq);
   // Keep IPC token and pipe path out of process command-line arguments.
-  driver.stdin.write(bootstrapInput({ executable: qq.executable, wrapper, dll: native.dll,
+  driver.stdin.write(bootstrapInput({ executable: qq.executable, wrapper, dll: native.dll, qqVersion: qq.version,
     payload: join(projectDir, 'native/session.cjs'), pipe: channel.path, token: channel.token }));
   // QQ inherits the bootstrap's stdio, so its own console output arrives here as well: keep all of it in
   // .runtime/qq.log and show only OpenQQ's bootstrap stages (QQ lines appear with /verbose).

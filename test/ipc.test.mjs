@@ -56,7 +56,7 @@ test('native payload connects without Inspector and restores methods when IPC cl
   const factory = { create: original };
   const connected = once(channel.events, 'connected');
   const wrapper = once(channel.events, 'event');
-  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token }, Object.freeze({ NodeIQQNTWrapperSession: Object.freeze(factory) }));
+  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token, qqVersion: "9.9.33-52230" }, Object.freeze({ NodeIQQNTWrapperSession: Object.freeze(factory) }));
   t.after(() => globalThis.__openqq_hook?.dispose());
   assert.equal((await connected)[0].pid, process.pid);
   assert.equal((await wrapper)[0].type, 'wrapper_loaded');
@@ -98,7 +98,7 @@ test('read-only exports deliver text and poke events through initialization, IPC
     channel.events.on('event', receive);
   });
   const wrapperLoaded = waitFor('wrapper_loaded');
-  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token }, Object.freeze({ NodeIQQNTWrapperSession: factory }));
+  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token, qqVersion: "9.9.33-52230" }, Object.freeze({ NodeIQQNTWrapperSession: factory }));
   t.after(() => globalThis.__openqq_hook?.dispose());
   await wrapperLoaded;
   const ready = waitFor('session_ready');
@@ -135,4 +135,12 @@ test('read-only exports deliver text and poke events through initialization, IPC
   const unknown = convert(await gray);
   assert.equal(unknown.notice_type, 'openqq_gray_tip');
   assert.deepEqual(unknown.element.nativeMap, { item: '7' });
+});
+
+test('native payload rejects a missing QQ version before opening IPC', () => {
+  assert.throws(
+    () => sessionModule.startNative({ pipe: 'unused-test-pipe', token: 'fixture-only' }, {}),
+    error => error.retcode === 1500 && /缺少 QQ 版本号/.test(error.message),
+  );
+  assert.equal(globalThis.__openqq_hook, undefined);
 });

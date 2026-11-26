@@ -269,7 +269,7 @@ test('a base64:// image above the 1 MiB IPC frame limit is sent: only the prepar
     getMSFService: () => ({ getServerTime: () => '1794470400' }),
   };
   const connected = once(channel.events, 'connected');
-  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token }, { NodeIQQNTWrapperSession: { get: () => session } });
+  const facade = sessionModule.startNative({ pipe: channel.path, token: channel.token, qqVersion: "9.9.33-52230" }, { NodeIQQNTWrapperSession: { get: () => session } });
   t.after(() => globalThis.__openqq_hook?.dispose());
   await connected;
   const ready = new Promise(resolve => channel.events.on('event', event => { if (event.type === 'session_ready') resolve(); }));

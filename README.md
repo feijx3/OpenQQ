@@ -38,6 +38,7 @@ Windows x64 与 Linux（x64 / arm64）QQ NT 的 OneBot v11 桥接，同时支持
 
 - Windows 10 / 11 x64（QQ NT 9.x，已测试 `9.9.33-52230` 和 `9.9.37-54395`）或 Linux x64 / arm64（官方 Linux QQ NT，默认路径 `/opt/QQ`）或 Docker
 - 其他带完整 N-API 导出的同平台 QQ NT 构建也能启动，但会提示该版本没有完整实机验证。
+- `get_group_file_url` 的新增原生通道仅验证 Windows x64 QQ `9.9.33-52230`；Linux/Docker 未适配，详见 [动作环境范围](docs/actions.md#群文件下载链接的环境范围)。
 - Node.js >= 22
 - 从源码构建需要本机已有 CMake 和 C++17 编译器（Windows 用 LLVM-MinGW / MinGW + Ninja 或 Visual Studio；Linux 用 `g++` / `clang++`，可选 `ninja`）。发布包里已有编译好的原生组件，不需要编译器。
 

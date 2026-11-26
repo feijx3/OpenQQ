@@ -185,6 +185,10 @@ function createHarness(overrides = {}) {
       },
     }),
     getMsgService: () => ({
+      sendSsoCmdReqByContend: async (command, data) => {
+        recordCall('sendSsoCmdReqByContend', [command, data]);
+        return { rspbuffer: pbBytes(4, pbBytes(3, Buffer.concat([pbVar(1, 0), pbBytes(5, 'cdn.example.com'), pbBytes(6, Buffer.from([0xab, 0xcd]))]))) };
+      },
       generateMsgUniqueId: () => String(++tagCounter),
       getRichMediaFilePathForGuild: ({ fileName }) => join(tmpdir(), fileName || 'media.bin'),
       getMsgEmojiLikesList: async (...args) => {
@@ -259,6 +263,12 @@ function createHarness(overrides = {}) {
   const receiver = createEventReceiver(session, self, e => rawEvents.push(e), () => true);
   const convert = createEventConverter();
   handler = nativeActions.createActionHandler(session, self, () => true, {
+    // Explicit fake transport: production must never infer test mode from a
+    // missing QQ version.
+    sendPacket: (service, command, data) => ({
+      promise: service.sendSsoCmdReqByContend(command, data),
+      release() {},
+    }),
     groups: receiver.groups,
     friendList: receiver.friendList,
     friendsWithCategory: receiver.friendsWithCategory,
@@ -537,7 +547,9 @@ test('group queries, admin, notices, group files, profile, ark, and credentials 
   assert.deepEqual(h.calls.deleteGroupFile[0], ['987654', [102], ['/f1']]);
   assert.equal((await dispatchAction(h.channel, h.convert, { action: 'trans_group_file', params: { group_id: 987654, file_id: '/f1' } })).status, 'ok');
   const fileUrl = await dispatchAction(h.channel, h.convert, { action: 'get_group_file_url', params: { group_id: 987654, file_id: '/f1' } });
-  assert.equal(fileUrl.data.url, 'https://cdn.example.com/group-file');
+  assert.equal(fileUrl.data.url, 'https://cdn.example.com/ftn_handler/abcd/?fname=');
+  assert.equal(h.calls.sendSsoCmdReqByContend[0][0], 'OidbSvcTrpcTcp.0x6D6_2');
+  assert.equal(h.calls.getGroupFileInfo, undefined);
 
   // Profile, friends, contacts, ark, credentials
   assert.equal((await dispatchAction(h.channel, h.convert, { action: 'set_friend_remark', params: { user_id: 654321, remark: '好友A' } })).status, 'ok');

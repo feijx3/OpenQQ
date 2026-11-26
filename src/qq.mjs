@@ -258,10 +258,10 @@ export function resolveLinuxWrapper(qq, configHome = process.env.XDG_CONFIG_HOME
   return qq.wrapper;
 }
 
-export function bootstrapInput({ executable, wrapper, dll, payload, pipe, token }) {
+export function bootstrapInput({ executable, wrapper, dll, payload, pipe, token, qqVersion }) {
   for (const value of [executable, wrapper, dll, payload, pipe, token]) {
     if (typeof value !== 'string' || !value || /[\0\r\n]/.test(value)) throw new Error('原生引导配置无效');
   }
-  const source = `(() => { const load = typeof require === 'function' ? require : process.getBuiltinModule?.('module')?.createRequire(process.execPath) ?? process.mainModule?.require.bind(process.mainModule); if (!load) throw new Error('QQ 没有可用 CommonJS 入口'); try { return load(${JSON.stringify(payload)}).startNative(${JSON.stringify({ pipe, token })}, globalThis.__openqq_exports); } finally { delete globalThis.__openqq_exports; } })()`;
+  const source = `(() => { const load = typeof require === 'function' ? require : process.getBuiltinModule?.('module')?.createRequire(process.execPath) ?? process.mainModule?.require.bind(process.mainModule); if (!load) throw new Error('QQ 没有可用 CommonJS 入口'); try { return load(${JSON.stringify(payload)}).startNative(${JSON.stringify({ pipe, token, ...(qqVersion ? { qqVersion } : {}) })}, globalThis.__openqq_exports); } finally { delete globalThis.__openqq_exports; } })()`;
   return [executable, wrapper, dll, source].join('\n') + '\n';
 }
